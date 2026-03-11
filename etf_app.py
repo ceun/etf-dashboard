@@ -32,8 +32,10 @@ TRADITION_START = "20081031"
 TRADITION_END   = "20221031"
 ROLLING_WINDOW  = 1250
 # Supabase 连接字符串（从 Streamlit secrets 读取）
-# 优先使用连接池 URL（更稳，通常可规避 IPv6/直连网络问题）
-DATABASE_URL = st.secrets.get("database_url_pooler", None) or st.secrets.get("database_url", None)
+# 注意：直连 db.<project>.supabase.co 在部分网络下仅返回 IPv6，建议使用 pooler。
+DATABASE_URL_POOLER = st.secrets.get("database_url_pooler", None)
+DATABASE_URL_DIRECT = st.secrets.get("database_url", None)
+DATABASE_URL = DATABASE_URL_POOLER or DATABASE_URL_DIRECT
 # 全局变量：存储缩放比例（指数点位 ÷ ETF价格）
 SCALING_FACTOR = {}
 
@@ -46,6 +48,9 @@ def get_db_connection():
     """获取数据库连接（每次新建，避免缓存已关闭连接）"""
     if not DATABASE_URL:
         return None
+
+    if not DATABASE_URL_POOLER:
+        st.warning("建议在 Streamlit secrets 配置 database_url_pooler（Supabase Connection Pooling URI），可避免 IPv6 直连问题。")
 
     # 先按原始 DSN 连接；若网络优先解析到 IPv6 且本机无 IPv6 出口，再回退到 IPv4。
     try:
@@ -64,7 +69,11 @@ def get_db_connection():
                 st.error(f"数据库连接失败: {e}")
                 return None
 
-            ipv4_addr = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+            ipv4_list = socket.getaddrinfo(host, None, socket.AF_INET)
+            if not ipv4_list:
+                st.error("数据库连接失败：当前直连地址无 IPv4 解析结果。请改用 Supabase pooler 连接串（database_url_pooler）。")
+                return None
+            ipv4_addr = ipv4_list[0][4][0]
 
             dbname = parsed.path.lstrip("/")
             user = unquote(parsed.username or "")
