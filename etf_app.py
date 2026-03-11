@@ -1,0 +1,348 @@
+import os
+import sqlite3
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import akshare as ak
+import streamlit as st
+
+warnings.filterwarnings('ignore')
+
+# ─── 页面配置 ────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="ETF估值仪表板", page_icon="📈", layout="wide")
+
+# ─── 全局配置 ────────────────────────────────────────────────────────────────
+ETF_CONFIG = {
+    "沪深300":    {"name": "沪深300",    "etf_code": "510300"},
+    "红利低波":   {"name": "红利低波",   "etf_code": "563020"},
+    "800现金流":  {"name": "800现金流",  "etf_code": "563990"},
+    "消费龙头":   {"name": "消费龙头",   "etf_code": "159520"},
+    "食品饮料":   {"name": "食品饮料",   "etf_code": "516900"},
+    "港股通非银": {"name": "港股通非银", "etf_code": "513750"},
+    "价值100":    {"name": "价值100",    "etf_code": "159263"},
+    "深红利":     {"name": "深红利",     "etf_code": "159905"},
+}
+
+TRADITION_START = "20081031"
+TRADITION_END   = "20221031"
+ROLLING_WINDOW  = 1250
+# 云端用临时路径，本地优先用桌面
+DB_PATH = os.path.join(os.path.dirname(__file__), "etf_data.db")
+
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# ─── 数据库工具 ───────────────────────────────────────────────────────────────
+def _init_db(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS etf_prices (
+            etf_code TEXT, date TEXT, close REAL,
+            PRIMARY KEY (etf_code, date)
+        )
+    """)
+    conn.commit()
+
+
+def save_to_db(df, etf_code):
+    conn = sqlite3.connect(DB_PATH)
+    _init_db(conn)
+    records = [(etf_code, r['Date'].strftime('%Y-%m-%d'), float(r['Close']))
+               for _, r in df.iterrows()]
+    conn.executemany("INSERT OR REPLACE INTO etf_prices VALUES (?, ?, ?)", records)
+    conn.commit()
+    conn.close()
+
+
+def load_from_db(etf_code):
+    if not os.path.exists(DB_PATH):
+        return None
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql(
+        "SELECT date AS Date, close AS Close FROM etf_prices WHERE etf_code=? ORDER BY date",
+        conn, params=(etf_code,)
+    )
+    conn.close()
+    if df.empty:
+        return None
+    df['Date']  = pd.to_datetime(df['Date'])
+    df['Close'] = df['Close'].astype(float)
+    return df.reset_index(drop=True)
+
+
+# ─── AkShare 全量拉取（云端无本地文件时使用）────────────────────────────────
+def fetch_all_from_akshare(etf_code):
+    """拉取 ETF 后复权全量日线数据"""
+    etf_df = ak.fund_etf_hist_em(symbol=etf_code, period="daily", adjust="hfq")
+    etf_df['日期'] = pd.to_datetime(etf_df['日期'])
+    etf_df = etf_df[['日期', '收盘']].rename(columns={'日期': 'Date', '收盘': 'Close'})
+    return etf_df.sort_values('Date').reset_index(drop=True)
+
+
+def update_with_akshare(df, etf_code):
+    """增量更新：只拉 df 中最新日期之后的数据"""
+    try:
+        new_all = fetch_all_from_akshare(etf_code)
+        last_date = df['Date'].max()
+        new_data = new_all[new_all['Date'] > last_date]
+        if not new_data.empty:
+            df = pd.concat([df, new_data], ignore_index=True)
+        return df
+    except Exception as e:
+        st.warning(f"⚠️ AkShare 更新失败 ({etf_code}): {e}")
+        return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_data(etf_code: str):
+    """
+    优先从本地 DB 加载 → 增量更新 → 写回 DB
+    若 DB 无数据，则从 AkShare 拉全量
+    """
+    df = load_from_db(etf_code)
+    if df is None:
+        df = fetch_all_from_akshare(etf_code)
+    else:
+        df = update_with_akshare(df, etf_code)
+    if df is not None and not df.empty:
+        save_to_db(df, etf_code)
+    return df
+
+
+# ─── 核心分析 ─────────────────────────────────────────────────────────────────
+def compute_and_plot(df, etf_name, deviation_pct):
+    df = df.copy()
+    df['Log_Close'] = np.log(df['Close'])
+    df['Time_Idx']  = np.arange(len(df))
+
+    # 传统回归
+    mask = (df['Date'] >= pd.to_datetime(TRADITION_START)) & \
+           (df['Date'] <= pd.to_datetime(TRADITION_END))
+    sample_df = df[mask]
+    if len(sample_df) < 100:
+        raise ValueError(f"传统回归样本不足（{len(sample_df)} 条），请检查数据起止日期")
+    k_trad, b_trad = np.polyfit(sample_df['Time_Idx'], sample_df['Log_Close'], 1)
+    df['Trad_Pred_Log']   = k_trad * df['Time_Idx'] + b_trad
+    df['Trad_Pred_Price'] = np.exp(df['Trad_Pred_Log'])
+    resids_trad = sample_df['Log_Close'] - (k_trad * sample_df['Time_Idx'] + b_trad)
+    std_trad    = np.std(resids_trad)
+    df['Trad_Z_Score'] = (df['Log_Close'] - df['Trad_Pred_Log']) / std_trad
+    z_plus  = np.log(1 + deviation_pct / 100.0) / std_trad
+    z_minus = np.log(1 - deviation_pct / 100.0) / std_trad
+
+    # 滚动回归
+    rolling_preds = np.full(len(df), np.nan)
+    rolling_z     = np.full(len(df), np.nan)
+    k_roll_last   = np.nan
+    for i in range(ROLLING_WINDOW, len(df)):
+        ys = df['Log_Close'].values[i - ROLLING_WINDOW:i]
+        xs = np.arange(ROLLING_WINDOW)
+        k_r, b_r = np.polyfit(xs, ys, 1)
+        pred = k_r * (ROLLING_WINDOW - 1) + b_r
+        rolling_preds[i] = pred
+        std_r = np.std(ys - (k_r * xs + b_r))
+        if std_r > 0:
+            rolling_z[i] = (ys[-1] - pred) / std_r
+        k_roll_last = k_r
+    df['Roll_Pred_Price'] = np.exp(rolling_preds)
+    df['Roll_Z_Score']    = rolling_z
+
+    # 绘图
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
+                                   gridspec_kw={'height_ratios': [2.5, 1]})
+    ax1.plot(df['Date'], df['Close'], color='black', linewidth=1.2, label='指数')
+    ax1.plot(df['Date'], df['Trad_Pred_Price'], color='red', linestyle='--',
+             linewidth=2, label=f'传统回归({TRADITION_START[:4]}-{TRADITION_END[:4]})')
+    ax1.fill_between(df['Date'],
+                     np.exp(df['Trad_Pred_Log'] - 2 * std_trad),
+                     np.exp(df['Trad_Pred_Log'] + 2 * std_trad),
+                     color='red', alpha=0.1, label='传统通道(±2σ)')
+    ax1.plot(df['Date'], df['Roll_Pred_Price'], color='blue', linestyle='-.',
+             linewidth=1.5, label=f'滚动回归({ROLLING_WINDOW}日)')
+    ax1.set_yscale('log')
+    ax1.set_title(f'{etf_name} 全收益', fontsize=15, fontweight='bold')
+    ax1.set_ylabel('点位（对数）', fontsize=11)
+    ax1.legend(loc='upper left', fontsize=9)
+    ax1.grid(True, which='both', linestyle=':', alpha=0.6)
+
+    ax2.axhline(0,  color='black', linewidth=1)
+    ax2.axhline(2,  color='red',   linestyle='--', alpha=0.5, label='+2σ')
+    ax2.axhline(-2, color='green', linestyle='--', alpha=0.5, label='-2σ')
+    ax2.axhline(z_plus,  color='orange', linestyle=':', alpha=0.9,
+                label=f'+{deviation_pct:.0f}%(传统Z)')
+    ax2.axhline(z_minus, color='orange', linestyle=':', alpha=0.9,
+                label=f'-{deviation_pct:.0f}%(传统Z)')
+    ax2.plot(df['Date'], df['Roll_Z_Score'], color='blue', linestyle='-',
+             alpha=0.8, linewidth=1.2, label='滚动Z', zorder=2)
+    ax2.plot(df['Date'], df['Trad_Z_Score'], color='black',
+             alpha=0.95, linewidth=1.5, label='传统Z', zorder=3)
+    ax2.set_title('Z-Score 偏离度', fontsize=13)
+    ax2.set_ylabel('Z-Score', fontsize=11)
+    ax2.legend(loc='upper left', fontsize=9)
+    ax2.grid(True, linestyle=':', alpha=0.6)
+
+    yl = mdates.YearLocator(1)
+    yf = mdates.DateFormatter('%Y')
+    for ax in (ax1, ax2):
+        ax.xaxis.set_major_locator(yl)
+        ax.xaxis.set_major_formatter(yf)
+        ax.set_xlim(df['Date'].min(), df['Date'].max())
+        ax.margins(x=0)
+    fig.autofmt_xdate()
+    plt.tight_layout()
+
+    latest_close = float(df['Close'].iloc[-1])
+    trad_pred    = float(df['Trad_Pred_Price'].iloc[-1])
+    roll_pred    = float(df['Roll_Pred_Price'].iloc[-1])
+    return fig, {
+        "latest_date":  df['Date'].iloc[-1].strftime('%Y-%m-%d'),
+        "latest_close": latest_close,
+        "trad_pred":    trad_pred,
+        "roll_pred":    roll_pred,
+        "dev_trad":     (latest_close / trad_pred - 1) * 100,
+        "dev_roll":     (latest_close / roll_pred - 1) * 100,
+        "cagr_trad":    (np.exp(k_trad * 252) - 1) * 100,
+        "cagr_roll":    (np.exp(k_roll_last * 252) - 1) * 100,
+    }
+
+
+# ─── 全市场对比 ───────────────────────────────────────────────────────────────
+def build_comparison(deviation_pct):
+    rows = []
+    for name, cfg in ETF_CONFIG.items():
+        df = load_from_db(cfg['etf_code'])
+        if df is None or len(df) < ROLLING_WINDOW + 10:
+            rows.append({"标的": name, "ETF代码": cfg['etf_code'],
+                         "最新日期": "无数据（请先刷新）",
+                         "传统偏离度(%)": None, "滚动偏离度(%)": None,
+                         "传统CAGR(%)": None, "滚动CAGR(%)": None})
+            continue
+        try:
+            fig, res = compute_and_plot(df, name, deviation_pct)
+            plt.close(fig)
+            rows.append({
+                "标的": name, "ETF代码": cfg['etf_code'],
+                "最新日期":    res['latest_date'],
+                "传统偏离度(%)": round(res['dev_trad'], 2),
+                "滚动偏离度(%)": round(res['dev_roll'], 2),
+                "传统CAGR(%)":   round(res['cagr_trad'], 2),
+                "滚动CAGR(%)":   round(res['cagr_roll'], 2),
+            })
+        except Exception as e:
+            rows.append({"标的": name, "ETF代码": cfg['etf_code'],
+                         "最新日期": f"出错: {e}",
+                         "传统偏离度(%)": None, "滚动偏离度(%)": None,
+                         "传统CAGR(%)": None, "滚动CAGR(%)": None})
+    return pd.DataFrame(rows)
+
+
+# ─── Streamlit UI ─────────────────────────────────────────────────────────────
+st.title("📈 ETF 回归估值仪表板")
+
+with st.sidebar:
+    st.header("⚙️ 参数设置")
+    selected       = st.selectbox("选择标的", list(ETF_CONFIG.keys()))
+    deviation_pct  = st.slider("偏离阈值 (%)", 5, 30, 15, 1)
+
+    st.divider()
+    if st.button("🔄 更新全部数据", use_container_width=True, type="primary"):
+        st.cache_data.clear()
+        prog = st.progress(0)
+        etf_list = list(ETF_CONFIG.items())
+        for idx, (name, cfg) in enumerate(etf_list):
+            with st.spinner(f"拉取 {name}..."):
+                try:
+                    get_data(cfg['etf_code'])
+                except Exception as e:
+                    st.warning(f"{name} 失败: {e}")
+            prog.progress((idx + 1) / len(etf_list))
+        st.success("✅ 全部数据已更新！")
+        st.rerun()
+
+    st.divider()
+    if os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        summary = pd.read_sql(
+            "SELECT etf_code, COUNT(*) AS 条数, MAX(date) AS 最新日期 "
+            "FROM etf_prices GROUP BY etf_code", conn)
+        conn.close()
+        if not summary.empty:
+            st.caption("📊 数据库已有数据")
+            st.dataframe(summary, hide_index=True, use_container_width=True)
+
+# ─── 主内容区 ─────────────────────────────────────────────────────────────────
+cfg      = ETF_CONFIG[selected]
+etf_code = cfg['etf_code']
+etf_name = cfg['name']
+
+tab1, tab2 = st.tabs(["📊 单标的详情", "📋 全市场对比"])
+
+with tab1:
+    with st.spinner(f"加载 {etf_name} ({etf_code}) 数据..."):
+        try:
+            df = get_data(etf_code)
+        except Exception as e:
+            st.error(f"❌ 数据加载失败：{e}")
+            st.stop()
+
+    if df is None or len(df) < ROLLING_WINDOW + 10:
+        st.error("数据不足，无法计算回归，请点击「更新全部数据」")
+    else:
+        try:
+            fig, res = compute_and_plot(df, etf_name, deviation_pct)
+            st.pyplot(fig)
+            plt.close(fig)
+
+            st.divider()
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("最新日期",     res['latest_date'])
+            c2.metric("传统回归点位", f"{res['trad_pred']:,.0f}")
+            c3.metric("传统偏离度",   f"{res['dev_trad']:+.2f}%", delta_color="inverse")
+            c4.metric("传统年化收益", f"{res['cagr_trad']:.2f}%")
+            c5.metric("滚动回归点位", f"{res['roll_pred']:,.0f}")
+            c6.metric("滚动偏离度",   f"{res['dev_roll']:+.2f}%", delta_color="inverse")
+        except Exception as e:
+            st.error(f"计算出错：{e}")
+
+with tab2:
+    st.caption("对比数据来自本地 DB，更新请点击侧边栏「更新全部数据」")
+    with st.spinner("计算全市场偏离度..."):
+        compare_df = build_comparison(deviation_pct)
+
+    if compare_df.empty:
+        st.info("数据库暂无数据，请先点击「更新全部数据」")
+    else:
+        numeric_cols = ["传统偏离度(%)", "滚动偏离度(%)"]
+        styled = compare_df.style.background_gradient(
+            subset=[c for c in numeric_cols if c in compare_df.columns],
+            cmap="RdYlGn_r", vmin=-30, vmax=30
+        ).format({
+            "传统偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
+            "滚动偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
+            "传统CAGR(%)":   lambda x: f"{x:.2f}"  if pd.notna(x) else "—",
+            "滚动CAGR(%)":   lambda x: f"{x:.2f}"  if pd.notna(x) else "—",
+        })
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        plot_df = compare_df.dropna(subset=["传统偏离度(%)", "滚动偏离度(%)"])
+        if not plot_df.empty:
+            st.subheader("偏离度可视化对比")
+            fig2, ax = plt.subplots(figsize=(12, max(4, len(plot_df) * 0.7)))
+            x = np.arange(len(plot_df))
+            w = 0.35
+            ax.barh(x + w/2, plot_df["传统偏离度(%)"], w, color='red',  alpha=0.7, label='传统偏离度')
+            ax.barh(x - w/2, plot_df["滚动偏离度(%)"], w, color='blue', alpha=0.7, label='滚动偏离度')
+            ax.axvline(0, color='black', linewidth=1)
+            ax.axvline( deviation_pct, color='orange', linestyle=':', alpha=0.8)
+            ax.axvline(-deviation_pct, color='orange', linestyle=':', alpha=0.8,
+                       label=f'±{deviation_pct}%')
+            ax.set_yticks(x)
+            ax.set_yticklabels(plot_df["标的"], fontsize=11)
+            ax.set_xlabel("偏离度 (%)")
+            ax.legend(fontsize=10)
+            ax.grid(True, axis='x', linestyle=':', alpha=0.5)
+            plt.tight_layout()
+            st.pyplot(fig2)
+            plt.close(fig2)
