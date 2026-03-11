@@ -1,5 +1,5 @@
 import os
-import sqlite3
+import psycopg2
 import warnings
 import numpy as np
 import pandas as pd
@@ -28,48 +28,86 @@ ETF_CONFIG = {
 TRADITION_START = "20081031"
 TRADITION_END   = "20221031"
 ROLLING_WINDOW  = 1250
-# 云端用临时路径，本地优先用桌面
-DB_PATH = os.path.join(os.path.dirname(__file__), "etf_data.db")
+# Supabase 连接字符串（从 Streamlit secrets 读取）
+DATABASE_URL = st.secrets.get("database_url", None)
+# 全局变量：存储缩放比例（指数点位 ÷ ETF价格）
+SCALING_FACTOR = {}
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
 
 # ─── 数据库工具 ───────────────────────────────────────────────────────────────
-def _init_db(conn):
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS etf_prices (
-            etf_code TEXT, date TEXT, close REAL,
-            PRIMARY KEY (etf_code, date)
-        )
-    """)
-    conn.commit()
+@st.cache_resource
+def get_db_connection():
+    """获取数据库连接（使用 Streamlit cache_resource 保持连接）"""
+    if not DATABASE_URL:
+        return None
+    try:
+        return psycopg2.connect(DATABASE_URL)
+    except Exception as e:
+        st.error(f"数据库连接失败: {e}")
+        return None
 
 
 def save_to_db(df, etf_code):
-    conn = sqlite3.connect(DB_PATH)
-    _init_db(conn)
-    records = [(etf_code, r['Date'].strftime('%Y-%m-%d'), float(r['Close']))
-               for _, r in df.iterrows()]
-    conn.executemany("INSERT OR REPLACE INTO etf_prices VALUES (?, ?, ?)", records)
-    conn.commit()
-    conn.close()
+    """将数据写入 PostgreSQL，包含缩放比例"""
+    conn = get_db_connection()
+    if not conn:
+        st.warning("无法连接数据库，数据将不被保存")
+        return
+    
+    try:
+        cur = conn.cursor()
+        # 表已由 Supabase SQL 创建，这里只需插入数据
+        scaling_factor = SCALING_FACTOR.get(etf_code, 1.0)
+        
+        for _, row in df.iterrows():
+            cur.execute("""
+                INSERT INTO etf_prices (etf_code, date, close, scaling_factor) 
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (etf_code, date) DO UPDATE 
+                SET close = EXCLUDED.close, scaling_factor = EXCLUDED.scaling_factor
+            """, (etf_code, row['Date'].date(), float(row['Close']), float(scaling_factor)))
+        
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        st.warning(f"保存数据异常: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 def load_from_db(etf_code):
-    if not os.path.exists(DB_PATH):
+    """从 PostgreSQL 读取数据，同时加载缩放比例"""
+    conn = get_db_connection()
+    if not conn:
         return None
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql(
-        "SELECT date AS Date, close AS Close FROM etf_prices WHERE etf_code=? ORDER BY date",
-        conn, params=(etf_code,)
-    )
-    conn.close()
-    if df.empty:
+    
+    try:
+        df = pd.read_sql(
+            "SELECT date AS Date, close AS Close, scaling_factor FROM etf_prices WHERE etf_code=%s ORDER BY date",
+            conn, params=(etf_code,)
+        )
+        if df.empty:
+            return None
+        
+        # 从数据库读取缩放比例，保存到全局
+        latest_scaling = df['scaling_factor'].iloc[-1]
+        if pd.notna(latest_scaling):
+            SCALING_FACTOR[etf_code] = float(latest_scaling)
+        
+        df['Date'] = pd.to_datetime(df['Date'])
+        df['Close'] = df['Close'].astype(float)
+        # 只返回 Date 和 Close，scaling_factor 存在全局变量中
+        return df[['Date', 'Close']].reset_index(drop=True)
+    except Exception as e:
+        st.warning(f"读取数据异常: {e}")
         return None
-    df['Date']  = pd.to_datetime(df['Date'])
-    df['Close'] = df['Close'].astype(float)
-    return df.reset_index(drop=True)
+    finally:
+        if conn:
+            conn.close()
 
 
 # ─── AkShare 全量拉取（云端无本地文件时使用）────────────────────────────────
@@ -77,18 +115,39 @@ def fetch_all_from_akshare(etf_code):
     """拉取 ETF 后复权全量日线数据"""
     etf_df = ak.fund_etf_hist_em(symbol=etf_code, period="daily", adjust="hfq")
     etf_df['日期'] = pd.to_datetime(etf_df['日期'])
+    # 返回 Date, Close（ETF收盘价）
     etf_df = etf_df[['日期', '收盘']].rename(columns={'日期': 'Date', '收盘': 'Close'})
     return etf_df.sort_values('Date').reset_index(drop=True)
 
 
 def update_with_akshare(df, etf_code):
-    """增量更新：只拉 df 中最新日期之后的数据"""
+    """增量更新：拉最新数据，计算并保存缩放比例"""
     try:
-        new_all = fetch_all_from_akshare(etf_code)
+        new_all = ak.fund_etf_hist_em(symbol=etf_code, period="daily", adjust="hfq")
+        new_all['日期'] = pd.to_datetime(new_all['日期'])
+        new_all = new_all[['日期', '收盘']].rename(columns={'日期': 'Date', '收盘': 'ETF_Close'})
+        
         last_date = df['Date'].max()
-        new_data = new_all[new_all['Date'] > last_date]
+        
+        # 锚点：计算缩放比例
+        merged = pd.merge(df[['Date', 'Close']], new_all, on='Date', how='inner')
+        if not merged.empty:
+            anchor_row = merged.iloc[-1]
+            scaling_factor = anchor_row['Close'] / anchor_row['ETF_Close']
+            SCALING_FACTOR[etf_code] = scaling_factor
+            print(f"缩放比例 ({etf_code}): {scaling_factor:.4f}")
+        else:
+            scaling_factor = SCALING_FACTOR.get(etf_code, 1.0)
+        
+        # 拼接新数据
+        new_data = new_all[new_all['Date'] > last_date].copy()
         if not new_data.empty:
+            new_data['Close'] = new_data['ETF_Close'] * scaling_factor
+            new_data = new_data[['Date', 'Close']]
             df = pd.concat([df, new_data], ignore_index=True)
+            print(f"成功拼接 {len(new_data)} 条数据")
+        
+        save_to_db(df, etf_code)
         return df
     except Exception as e:
         st.warning(f"⚠️ AkShare 更新失败 ({etf_code}): {e}")
@@ -98,16 +157,20 @@ def update_with_akshare(df, etf_code):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_data(etf_code: str):
     """
-    优先从本地 DB 加载 → 增量更新 → 写回 DB
-    若 DB 无数据，则从 AkShare 拉全量
+    优先从数据库加载 → 增量更新 → 写回数据库
+    若数据库无数据，则从 AkShare 拉全量
     """
     df = load_from_db(etf_code)
     if df is None:
+        # 首次拉取：全量历史
         df = fetch_all_from_akshare(etf_code)
-    else:
-        df = update_with_akshare(df, etf_code)
-    if df is not None and not df.empty:
+        # 暂时设缩放比例为 1.0，后续用户上传 Excel 时更新
+        SCALING_FACTOR[etf_code] = 1.0
         save_to_db(df, etf_code)
+    else:
+        # 增量更新
+        df = update_with_akshare(df, etf_code)
+    
     return df
 
 
@@ -196,15 +259,23 @@ def compute_and_plot(df, etf_name, deviation_pct):
     latest_close = float(df['Close'].iloc[-1])
     trad_pred    = float(df['Trad_Pred_Price'].iloc[-1])
     roll_pred    = float(df['Roll_Pred_Price'].iloc[-1])
+    
+    # 用缩放比例换算成ETF价格（指数点位 ÷ 缩放比例）
+    scaling_factor = SCALING_FACTOR.get(etf_name, 1.0) if isinstance(etf_name, str) else 1.0
+    
     return fig, {
         "latest_date":  df['Date'].iloc[-1].strftime('%Y-%m-%d'),
         "latest_close": latest_close,
+        "latest_etf_price": latest_close / scaling_factor if scaling_factor > 0 else latest_close,
         "trad_pred":    trad_pred,
+        "trad_pred_etf": trad_pred / scaling_factor if scaling_factor > 0 else trad_pred,
         "roll_pred":    roll_pred,
+        "roll_pred_etf": roll_pred / scaling_factor if scaling_factor > 0 else roll_pred,
         "dev_trad":     (latest_close / trad_pred - 1) * 100,
         "dev_roll":     (latest_close / roll_pred - 1) * 100,
         "cagr_trad":    (np.exp(k_trad * 252) - 1) * 100,
         "cagr_roll":    (np.exp(k_roll_last * 252) - 1) * 100,
+        "scaling_factor": scaling_factor,
     }
 
 
@@ -262,15 +333,21 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    if os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
-        summary = pd.read_sql(
-            "SELECT etf_code, COUNT(*) AS 条数, MAX(date) AS 最新日期 "
-            "FROM etf_prices GROUP BY etf_code", conn)
-        conn.close()
-        if not summary.empty:
-            st.caption("📊 数据库已有数据")
-            st.dataframe(summary, hide_index=True, use_container_width=True)
+    if DATABASE_URL:
+        try:
+            conn = get_db_connection()
+            if conn:
+                summary = pd.read_sql(
+                    "SELECT etf_code, COUNT(*) AS 条数, MAX(date) AS 最新日期 "
+                    "FROM etf_prices GROUP BY etf_code ORDER BY etf_code", conn)
+                conn.close()
+                if not summary.empty:
+                    st.caption("📊 Supabase 数据库已有数据")
+                    st.dataframe(summary, hide_index=True, use_container_width=True)
+        except Exception as e:
+            st.caption(f"⚠️ 无法查询数据库: {e}")
+    else:
+        st.warning("⚠️ 未配置 database_url，请先设置 Streamlit secrets")
 
 # ─── 主内容区 ─────────────────────────────────────────────────────────────────
 cfg      = ETF_CONFIG[selected]
@@ -296,18 +373,31 @@ with tab1:
             plt.close(fig)
 
             st.divider()
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("最新日期",     res['latest_date'])
-            c2.metric("传统回归点位", f"{res['trad_pred']:,.0f}")
-            c3.metric("传统偏离度",   f"{res['dev_trad']:+.2f}%", delta_color="inverse")
-            c4.metric("传统年化收益", f"{res['cagr_trad']:.2f}%")
-            c5.metric("滚动回归点位", f"{res['roll_pred']:,.0f}")
-            c6.metric("滚动偏离度",   f"{res['dev_roll']:+.2f}%", delta_color="inverse")
+            # 显示指数点位 + ETF价格两行
+            st.subheader("指数点位 & ETF价格")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("最新日期", res['latest_date'])
+            c2.metric("指数点位", f"{res['latest_close']:,.0f}")
+            c3.metric("ETF价格", f"{res['latest_etf_price']:.4f}")
+            
+            st.subheader("传统回归")
+            c4, c5, c6, c7 = st.columns(4)
+            c4.metric("点位", f"{res['trad_pred']:,.0f}")
+            c5.metric("ETF价", f"{res['trad_pred_etf']:.4f}")
+            c6.metric("偏离度", f"{res['dev_trad']:+.2f}%", delta_color="inverse")
+            c7.metric("年化收益", f"{res['cagr_trad']:.2f}%")
+            
+            st.subheader("滚动回归")
+            c8, c9, c10, c11 = st.columns(4)
+            c8.metric("点位", f"{res['roll_pred']:,.0f}")
+            c9.metric("ETF价", f"{res['roll_pred_etf']:.4f}")
+            c10.metric("偏离度", f"{res['dev_roll']:+.2f}%", delta_color="inverse")
+            c11.metric("年化收益", f"{res['cagr_roll']:.2f}%")
         except Exception as e:
             st.error(f"计算出错：{e}")
 
 with tab2:
-    st.caption("对比数据来自本地 DB，更新请点击侧边栏「更新全部数据」")
+    st.caption("对比数据来自 Supabase，更新请点击侧边栏「更新全部数据」")
     with st.spinner("计算全市场偏离度..."):
         compare_df = build_comparison(deviation_pct)
 
