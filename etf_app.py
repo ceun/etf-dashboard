@@ -417,7 +417,43 @@ def parse_upload_file(uploaded_file):
             return None, f"❌ 无法识别日期列或收盘列。找到的列: {list(df.columns)}"
         
         df = df[[date_col, close_col]].rename(columns={date_col: 'Date', close_col: 'Close'})
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+
+        # 兼容多种日期格式，避免数字日期被错误解析成 1970 年。
+        raw_date = df['Date']
+        parsed_date = pd.to_datetime(raw_date, errors='coerce')
+
+        numeric_raw = pd.to_numeric(raw_date, errors='coerce')
+        need_fix = parsed_date.isna() & numeric_raw.notna()
+
+        if need_fix.any():
+            n = numeric_raw[need_fix]
+            fixed = pd.Series(pd.NaT, index=n.index, dtype='datetime64[ns]')
+
+            # Excel 序列日期（天数）
+            excel_mask = (n >= 20000) & (n <= 80000)
+            if excel_mask.any():
+                fixed.loc[excel_mask] = pd.to_datetime(
+                    n.loc[excel_mask], unit='D', origin='1899-12-30', errors='coerce'
+                )
+
+            # 形如 20240311 的 YYYYMMDD 数字日期
+            ymd_mask = (n >= 19000101) & (n <= 21001231)
+            if ymd_mask.any():
+                ymd_str = n.loc[ymd_mask].round().astype('Int64').astype(str)
+                fixed.loc[ymd_mask] = pd.to_datetime(ymd_str, format='%Y%m%d', errors='coerce')
+
+            # Unix 时间戳（秒 / 毫秒）
+            sec_mask = (n >= 1_000_000_000) & (n < 10_000_000_000)
+            if sec_mask.any():
+                fixed.loc[sec_mask] = pd.to_datetime(n.loc[sec_mask], unit='s', errors='coerce')
+
+            ms_mask = (n >= 1_000_000_000_000) & (n < 10_000_000_000_000)
+            if ms_mask.any():
+                fixed.loc[ms_mask] = pd.to_datetime(n.loc[ms_mask], unit='ms', errors='coerce')
+
+            parsed_date.loc[need_fix] = fixed
+
+        df['Date'] = parsed_date
         df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
         df = df.dropna()
         df = df.sort_values('Date').reset_index(drop=True)
