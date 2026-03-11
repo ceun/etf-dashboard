@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import akshare as ak
 import streamlit as st
+from io import BytesIO
 
 warnings.filterwarnings('ignore')
 
@@ -309,6 +310,71 @@ def build_comparison(deviation_pct):
     return pd.DataFrame(rows)
 
 
+# ─── 数据管理工具 ─────────────────────────────────────────────────────────────
+def parse_upload_file(uploaded_file):
+    """解析 Excel/CSV 文件，返回 (DataFrame, message)"""
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+        
+        # 智能检测日期和收盘列
+        date_col = None
+        close_col = None
+        for col in df.columns:
+            col_lower = col.lower()
+            if '日期' in col_lower or 'date' in col_lower or col_lower == '时间':
+                date_col = col
+            if '收盘' in col_lower or 'close' in col_lower or '点位' in col_lower:
+                close_col = col
+        
+        if date_col is None or close_col is None:
+            return None, f"❌ 无法识别日期列或收盘列。找到的列: {list(df.columns)}"
+        
+        df = df[[date_col, close_col]].rename(columns={date_col: 'Date', close_col: 'Close'})
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+        df = df.dropna()
+        df = df.sort_values('Date').reset_index(drop=True)
+        
+        return df, f"✅ 成功解析 {len(df)} 条数据"
+    except Exception as e:
+        return None, f"❌ 解析文件出错: {e}"
+
+
+def stitch_with_akshare(history_df, etf_code):
+    """将历史数据与 AkShare 最新数据拼接，返回 (combined_df, scaling_factor, message)"""
+    try:
+        # 拉取 AkShare 数据
+        new_all = ak.fund_etf_hist_em(symbol=etf_code, period="daily", adjust="hfq")
+        new_all['日期'] = pd.to_datetime(new_all['日期'])
+        new_all = new_all[['日期', '收盘']].rename(columns={'日期': 'Date', '收盘': 'ETF_Close'})
+        
+        last_date = history_df['Date'].max()
+        
+        # 查找锚点计算缩放比例
+        merged = pd.merge(history_df[['Date', 'Close']], new_all, on='Date', how='inner')
+        if merged.empty:
+            return None, 1.0, "❌ 历史数据与 AkShare 无重叠日期，无法计算缩放比例"
+        
+        anchor_row = merged.iloc[-1]
+        scaling_factor = anchor_row['Close'] / anchor_row['ETF_Close']
+        
+        # 拼接新数据
+        new_data = new_all[new_all['Date'] > last_date].copy()
+        if not new_data.empty:
+            new_data['Close'] = new_data['ETF_Close'] * scaling_factor
+            new_data = new_data[['Date', 'Close']]
+            combined = pd.concat([history_df, new_data], ignore_index=True)
+        else:
+            combined = history_df
+        
+        return combined, scaling_factor, f"✅ 拼接成功，缩放比例: {scaling_factor:.4f}，新增 {len(new_data)} 条数据"
+    except Exception as e:
+        return None, 1.0, f"❌ 拼接 AkShare 失败: {e}"
+
+
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
 st.title("📈 ETF 回归估值仪表板")
 
@@ -354,7 +420,7 @@ cfg      = ETF_CONFIG[selected]
 etf_code = cfg['etf_code']
 etf_name = cfg['name']
 
-tab1, tab2 = st.tabs(["📊 单标的详情", "📋 全市场对比"])
+tab1, tab2, tab3 = st.tabs(["📊 单标的详情", "📋 全市场对比", "⚙️ 数据管理"])
 
 with tab1:
     with st.spinner(f"加载 {etf_name} ({etf_code}) 数据..."):
@@ -436,3 +502,65 @@ with tab2:
             plt.tight_layout()
             st.pyplot(fig2)
             plt.close(fig2)
+
+with tab3:
+    st.subheader("📤 上传历史数据并拼接 AkShare")
+    
+    # 创建两列布局
+    col_upload, col_stitch = st.columns(2)
+    
+    with col_upload:
+        st.write("**第1步：上传历史数据文件**")
+        uploaded_file = st.file_uploader("选择 Excel 或 CSV 文件", type=['xlsx', 'xls', 'csv'])
+        
+        if uploaded_file:
+            df_uploaded, msg = parse_upload_file(uploaded_file)
+            st.info(msg)
+            if df_uploaded is not None:
+                st.write(f"📊 预览数据 (前10行):")
+                st.dataframe(df_uploaded.head(10), use_container_width=True)
+    
+    with col_stitch:
+        st.write("**第2步：选择 ETF 并拼接**")
+        selected_etf = st.selectbox("选择要拼接的 ETF", list(ETF_CONFIG.keys()), key="stitch_etf")
+        
+        if uploaded_file and st.button("🔗 开始拼接 AkShare", use_container_width=True):
+            if df_uploaded is not None:
+                with st.spinner("正在拼接数据..."):
+                    etf_code = ETF_CONFIG[selected_etf]['etf_code']
+                    df_combined, scaling_factor, msg = stitch_with_akshare(df_uploaded, etf_code)
+                    st.info(msg)
+                    
+                    if df_combined is not None:
+                        st.write(f"✅ 拼接完成! (共 {len(df_combined)} 条数据)")
+                        st.dataframe(df_combined.head(10), use_container_width=True)
+                        
+                        # 保存按钮
+                        if st.button("💾 保存到数据库", use_container_width=True, type="primary"):
+                            with st.spinner("保存中..."):
+                                SCALING_FACTOR[etf_code] = scaling_factor
+                                save_to_db(df_combined, etf_code)
+                                st.success("✅ 数据已保存到 Supabase！")
+                                st.cache_data.clear()
+    
+    st.divider()
+    st.subheader("➕ 新增 ETF")
+    
+    col_name, col_code = st.columns(2)
+    
+    with col_name:
+        new_etf_name = st.text_input("ETF 名称", placeholder="例如：新etf指数")
+    
+    with col_code:
+        new_etf_code = st.text_input("ETF 代码", placeholder="例如：159999")
+    
+    if st.button("➕ 添加到系统", use_container_width=True):
+        if new_etf_name and new_etf_code:
+            ETF_CONFIG[new_etf_name] = {
+                "name": new_etf_name,
+                "etf_code": new_etf_code
+            }
+            st.success(f"✅ 已添加 {new_etf_name} ({new_etf_code})，刷新页面生效")
+            st.rerun()
+        else:
+            st.error("❌ 请填写完整的 ETF 名称和代码")
