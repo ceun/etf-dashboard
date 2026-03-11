@@ -73,12 +73,12 @@ def get_db_connection():
             query_params = parse_qs(parsed.query)
             sslmode = query_params.get("sslmode", ["require"])[0]
 
+            # 某些环境下 hostaddr 参数会触发地址格式校验报错，直接用 IPv4 作为 host 更稳。
             return psycopg2.connect(
                 dbname=dbname,
                 user=user,
                 password=password,
-                host=host,
-                hostaddr=ipv4_addr,
+                host=ipv4_addr,
                 port=port,
                 sslmode=sslmode,
                 connect_timeout=10,
