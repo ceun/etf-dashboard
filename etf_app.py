@@ -356,6 +356,44 @@ def build_comparison(deviation_pct, etf_config):
     return pd.DataFrame(rows)
 
 
+def load_targets_from_db(default_config):
+    """从数据库读取 etf_code 列表并构建运行时标的配置。"""
+    conn = get_db_connection()
+    if not conn:
+        return {k: v.copy() for k, v in default_config.items()}
+
+    try:
+        df_codes = pd.read_sql(
+            "SELECT DISTINCT etf_code FROM etf_prices WHERE etf_code IS NOT NULL ORDER BY etf_code",
+            conn,
+        )
+    except Exception as e:
+        st.caption(f"⚠️ 读取数据库标的失败，使用预设配置: {e}")
+        return {k: v.copy() for k, v in default_config.items()}
+    finally:
+        conn.close()
+
+    if df_codes.empty:
+        return {k: v.copy() for k, v in default_config.items()}
+
+    name_by_code = {cfg["etf_code"]: cfg["name"] for cfg in default_config.values()}
+    runtime_config = {}
+    used_names = set()
+
+    for code in df_codes["etf_code"].astype(str).tolist():
+        base_name = name_by_code.get(code, code)
+        name = base_name
+        if name in used_names:
+            name = f"{base_name}_{code}"
+        used_names.add(name)
+        runtime_config[name] = {
+            "name": name,
+            "etf_code": code,
+        }
+
+    return runtime_config
+
+
 # ─── 数据管理工具 ─────────────────────────────────────────────────────────────
 def parse_upload_file(uploaded_file):
     """解析 Excel/CSV 文件，返回 (DataFrame, message)"""
@@ -425,12 +463,17 @@ def stitch_with_akshare(history_df, etf_code):
 st.title("📈 ETF 回归估值仪表板")
 
 if "etf_config_runtime" not in st.session_state:
-    st.session_state["etf_config_runtime"] = {k: v.copy() for k, v in ETF_CONFIG.items()}
+    st.session_state["etf_config_runtime"] = load_targets_from_db(ETF_CONFIG)
 
 ACTIVE_ETF_CONFIG = st.session_state["etf_config_runtime"]
 
 with st.sidebar:
     st.header("⚙️ 参数设置")
+    if st.button("🔄 从数据库同步标的", use_container_width=True):
+        st.session_state["etf_config_runtime"] = load_targets_from_db(ETF_CONFIG)
+        st.rerun()
+
+    ACTIVE_ETF_CONFIG = st.session_state["etf_config_runtime"]
     selected       = st.selectbox("选择标的", list(ACTIVE_ETF_CONFIG.keys()))
     deviation_pct  = st.slider("偏离阈值 (%)", 5, 30, 15, 1)
 
