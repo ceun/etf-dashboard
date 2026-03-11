@@ -556,84 +556,89 @@ with tab2:
 
 with tab3:
     st.subheader("📤 上传历史数据并拼接 AkShare")
-    
-    # 创建两列布局
-    col_upload, col_stitch = st.columns(2)
-    
-    with col_upload:
-        st.write("**第1步：上传历史数据文件**")
-        uploaded_file = st.file_uploader("选择 Excel 或 CSV 文件", type=['xlsx', 'xls', 'csv'])
-        
-        if uploaded_file:
-            df_uploaded, msg = parse_upload_file(uploaded_file)
-            st.info(msg)
-            if df_uploaded is not None:
-                st.write(f"📊 预览数据 (前10行):")
-                st.dataframe(df_uploaded.head(10), use_container_width=True)
-    
-    with col_stitch:
-        st.write("**第2步：选择 ETF 并拼接**")
-        selected_etf = st.selectbox("选择要拼接的 ETF", list(ACTIVE_ETF_CONFIG.keys()), key="stitch_etf")
-        
-        if uploaded_file and st.button("🔗 开始拼接 AkShare", use_container_width=True):
-            if df_uploaded is not None:
-                with st.spinner("正在拼接数据..."):
-                    etf_code = ACTIVE_ETF_CONFIG[selected_etf]['etf_code']
-                    df_combined, scaling_factor, msg = stitch_with_akshare(df_uploaded, etf_code)
-                    st.info(msg)
-                    
-                    if df_combined is not None:
-                        st.write(f"✅ 拼接完成! (共 {len(df_combined)} 条数据)")
-                        st.dataframe(df_combined.head(10), use_container_width=True)
-                        
-                        # 保存按钮
-                        if st.button("💾 保存到数据库", use_container_width=True, type="primary"):
-                            with st.spinner("保存中..."):
-                                SCALING_FACTOR[etf_code] = scaling_factor
-                                save_to_db(df_combined, etf_code)
-                                st.success("✅ 数据已保存到 Supabase！")
-                                st.cache_data.clear()
-    
-    st.divider()
-    st.subheader("➕ 新增标的（必须绑定：指数历史文件 + ETF代码）")
-    
-    col_name, col_code = st.columns(2)
-    
-    with col_name:
-        new_etf_name = st.text_input("ETF 名称", placeholder="例如：新etf指数")
-    
-    with col_code:
-        new_etf_code = st.text_input("关联 ETF 代码", placeholder="例如：159999")
 
-    new_history_file = st.file_uploader(
-        "上传该标的的指数历史文件（xlsx/xls/csv）",
-        type=['xlsx', 'xls', 'csv'],
-        key="new_target_history_file"
+    mode = st.radio(
+        "选择操作模式",
+        ["已有标的：上传并拼接", "新增标的：绑定并导入"],
+        horizontal=True,
     )
-    
-    if st.button("➕ 绑定并导入", use_container_width=True, type="primary"):
-        target_name = (new_etf_name or "").strip()
-        target_code = (new_etf_code or "").strip()
 
-        if not target_name or not target_code or new_history_file is None:
-            st.error("❌ 新增标的必须同时提供：标的名称、ETF代码、指数历史文件")
-        elif target_name in ACTIVE_ETF_CONFIG:
-            st.error(f"❌ 标的 {target_name} 已存在，请更换名称")
-        else:
-            df_new, parse_msg = parse_upload_file(new_history_file)
-            st.info(parse_msg)
-            if df_new is not None:
-                with st.spinner("正在按绑定关系拼接并入库..."):
-                    df_combined, scaling_factor, stitch_msg = stitch_with_akshare(df_new, target_code)
-                    st.info(stitch_msg)
+    if mode == "已有标的：上传并拼接":
+        col_upload, col_stitch = st.columns(2)
 
-                    if df_combined is not None:
-                        SCALING_FACTOR[target_code] = scaling_factor
-                        save_to_db(df_combined, target_code)
-                        ACTIVE_ETF_CONFIG[target_name] = {
-                            "name": target_name,
-                            "etf_code": target_code,
-                        }
-                        st.cache_data.clear()
-                        st.success(f"✅ 已新增标的并完成绑定：{target_name} ↔ {target_code}，且历史数据已入库")
-                        st.rerun()
+        with col_upload:
+            st.write("**第1步：上传该标的的指数历史文件**")
+            uploaded_file = st.file_uploader(
+                "选择 Excel 或 CSV 文件",
+                type=['xlsx', 'xls', 'csv'],
+                key="existing_target_history_file",
+            )
+
+            df_uploaded = None
+            if uploaded_file:
+                df_uploaded, msg = parse_upload_file(uploaded_file)
+                st.info(msg)
+                if df_uploaded is not None:
+                    st.write("📊 预览数据 (前10行):")
+                    st.dataframe(df_uploaded.head(10), use_container_width=True)
+
+        with col_stitch:
+            st.write("**第2步：选择已有关联 ETF，并一键拼接入库**")
+            selected_etf = st.selectbox("选择要拼接的标的", list(ACTIVE_ETF_CONFIG.keys()), key="stitch_etf")
+
+            if st.button("🔗 拼接并保存到数据库", use_container_width=True, type="primary"):
+                if uploaded_file is None or df_uploaded is None:
+                    st.error("❌ 请先上传并解析历史文件")
+                else:
+                    with st.spinner("正在拼接并保存..."):
+                        etf_code = ACTIVE_ETF_CONFIG[selected_etf]['etf_code']
+                        df_combined, scaling_factor, msg = stitch_with_akshare(df_uploaded, etf_code)
+                        st.info(msg)
+
+                        if df_combined is not None:
+                            SCALING_FACTOR[etf_code] = scaling_factor
+                            save_to_db(df_combined, etf_code)
+                            st.cache_data.clear()
+                            st.success(f"✅ {selected_etf} 已拼接并保存，共 {len(df_combined)} 条")
+
+    else:
+        st.subheader("➕ 新增标的（必须绑定：指数历史文件 + ETF代码）")
+
+        col_name, col_code = st.columns(2)
+        with col_name:
+            new_etf_name = st.text_input("标的名称", placeholder="例如：新etf指数")
+        with col_code:
+            new_etf_code = st.text_input("关联 ETF 代码", placeholder="例如：159999")
+
+        new_history_file = st.file_uploader(
+            "上传该标的的指数历史文件（xlsx/xls/csv）",
+            type=['xlsx', 'xls', 'csv'],
+            key="new_target_history_file",
+        )
+
+        if st.button("➕ 绑定并导入", use_container_width=True, type="primary"):
+            target_name = (new_etf_name or "").strip()
+            target_code = (new_etf_code or "").strip()
+
+            if not target_name or not target_code or new_history_file is None:
+                st.error("❌ 新增标的必须同时提供：标的名称、ETF代码、指数历史文件")
+            elif target_name in ACTIVE_ETF_CONFIG:
+                st.error(f"❌ 标的 {target_name} 已存在，请更换名称")
+            else:
+                df_new, parse_msg = parse_upload_file(new_history_file)
+                st.info(parse_msg)
+                if df_new is not None:
+                    with st.spinner("正在按绑定关系拼接并入库..."):
+                        df_combined, scaling_factor, stitch_msg = stitch_with_akshare(df_new, target_code)
+                        st.info(stitch_msg)
+
+                        if df_combined is not None:
+                            SCALING_FACTOR[target_code] = scaling_factor
+                            save_to_db(df_combined, target_code)
+                            ACTIVE_ETF_CONFIG[target_name] = {
+                                "name": target_name,
+                                "etf_code": target_code,
+                            }
+                            st.cache_data.clear()
+                            st.success(f"✅ 已新增标的并完成绑定：{target_name} ↔ {target_code}，且历史数据已入库")
+                            st.rerun()
