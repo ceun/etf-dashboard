@@ -1,4 +1,5 @@
 import os
+import socket
 import psycopg2
 import warnings
 import numpy as np
@@ -8,6 +9,7 @@ import matplotlib.dates as mdates
 import akshare as ak
 import streamlit as st
 from io import BytesIO
+from urllib.parse import urlparse, parse_qs, unquote
 
 warnings.filterwarnings('ignore')
 
@@ -44,11 +46,45 @@ def get_db_connection():
     """获取数据库连接（使用 Streamlit cache_resource 保持连接）"""
     if not DATABASE_URL:
         return None
+
+    # 先按原始 DSN 连接；若网络优先解析到 IPv6 且本机无 IPv6 出口，再回退到 IPv4。
     try:
         return psycopg2.connect(DATABASE_URL)
     except Exception as e:
-        st.error(f"数据库连接失败: {e}")
-        return None
+        err_msg = str(e)
+        ipv6_issue = "Cannot assign requested address" in err_msg or "Network is unreachable" in err_msg
+        if not ipv6_issue:
+            st.error(f"数据库连接失败: {e}")
+            return None
+
+        try:
+            parsed = urlparse(DATABASE_URL)
+            host = parsed.hostname
+            if not host:
+                st.error(f"数据库连接失败: {e}")
+                return None
+
+            ipv4_addr = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+
+            dbname = parsed.path.lstrip("/")
+            user = unquote(parsed.username or "")
+            password = unquote(parsed.password or "")
+            port = parsed.port or 5432
+            query_params = parse_qs(parsed.query)
+            sslmode = query_params.get("sslmode", ["require"])[0]
+
+            return psycopg2.connect(
+                dbname=dbname,
+                user=user,
+                password=password,
+                host=host,
+                hostaddr=ipv4_addr,
+                port=port,
+                sslmode=sslmode,
+            )
+        except Exception as fallback_e:
+            st.error(f"数据库连接失败（IPv4回退后仍失败）: {fallback_e}")
+            return None
 
 
 def save_to_db(df, etf_code):
