@@ -32,7 +32,8 @@ TRADITION_START = "20081031"
 TRADITION_END   = "20221031"
 ROLLING_WINDOW  = 1250
 # Supabase 连接字符串（从 Streamlit secrets 读取）
-DATABASE_URL = st.secrets.get("database_url", None)
+# 优先使用连接池 URL（更稳，通常可规避 IPv6/直连网络问题）
+DATABASE_URL = st.secrets.get("database_url_pooler", None) or st.secrets.get("database_url", None)
 # 全局变量：存储缩放比例（指数点位 ÷ ETF价格）
 SCALING_FACTOR = {}
 
@@ -41,15 +42,14 @@ plt.rcParams['axes.unicode_minus'] = False
 
 
 # ─── 数据库工具 ───────────────────────────────────────────────────────────────
-@st.cache_resource
 def get_db_connection():
-    """获取数据库连接（使用 Streamlit cache_resource 保持连接）"""
+    """获取数据库连接（每次新建，避免缓存已关闭连接）"""
     if not DATABASE_URL:
         return None
 
     # 先按原始 DSN 连接；若网络优先解析到 IPv6 且本机无 IPv6 出口，再回退到 IPv4。
     try:
-        return psycopg2.connect(DATABASE_URL)
+        return psycopg2.connect(DATABASE_URL, connect_timeout=10)
     except Exception as e:
         err_msg = str(e)
         ipv6_issue = "Cannot assign requested address" in err_msg or "Network is unreachable" in err_msg
@@ -81,6 +81,7 @@ def get_db_connection():
                 hostaddr=ipv4_addr,
                 port=port,
                 sslmode=sslmode,
+                connect_timeout=10,
             )
         except Exception as fallback_e:
             st.error(f"数据库连接失败（IPv4回退后仍失败）: {fallback_e}")
