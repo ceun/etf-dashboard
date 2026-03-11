@@ -327,9 +327,9 @@ def compute_and_plot(df, etf_name, deviation_pct):
 
 
 # ─── 全市场对比 ───────────────────────────────────────────────────────────────
-def build_comparison(deviation_pct):
+def build_comparison(deviation_pct, etf_config):
     rows = []
-    for name, cfg in ETF_CONFIG.items():
+    for name, cfg in etf_config.items():
         df = load_from_db(cfg['etf_code'])
         if df is None or len(df) < ROLLING_WINDOW + 10:
             rows.append({"标的": name, "ETF代码": cfg['etf_code'],
@@ -424,16 +424,21 @@ def stitch_with_akshare(history_df, etf_code):
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
 st.title("📈 ETF 回归估值仪表板")
 
+if "etf_config_runtime" not in st.session_state:
+    st.session_state["etf_config_runtime"] = {k: v.copy() for k, v in ETF_CONFIG.items()}
+
+ACTIVE_ETF_CONFIG = st.session_state["etf_config_runtime"]
+
 with st.sidebar:
     st.header("⚙️ 参数设置")
-    selected       = st.selectbox("选择标的", list(ETF_CONFIG.keys()))
+    selected       = st.selectbox("选择标的", list(ACTIVE_ETF_CONFIG.keys()))
     deviation_pct  = st.slider("偏离阈值 (%)", 5, 30, 15, 1)
 
     st.divider()
     if st.button("🔄 更新全部数据", use_container_width=True, type="primary"):
         st.cache_data.clear()
         prog = st.progress(0)
-        etf_list = list(ETF_CONFIG.items())
+        etf_list = list(ACTIVE_ETF_CONFIG.items())
         for idx, (name, cfg) in enumerate(etf_list):
             with st.spinner(f"拉取 {name}..."):
                 try:
@@ -462,7 +467,7 @@ with st.sidebar:
         st.warning("⚠️ 未配置 database_url，请先设置 Streamlit secrets")
 
 # ─── 主内容区 ─────────────────────────────────────────────────────────────────
-cfg      = ETF_CONFIG[selected]
+cfg      = ACTIVE_ETF_CONFIG[selected]
 etf_code = cfg['etf_code']
 etf_name = cfg['name']
 
@@ -511,7 +516,7 @@ with tab1:
 with tab2:
     st.caption("对比数据来自 Supabase，更新请点击侧边栏「更新全部数据」")
     with st.spinner("计算全市场偏离度..."):
-        compare_df = build_comparison(deviation_pct)
+        compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG)
 
     if compare_df.empty:
         st.info("数据库暂无数据，请先点击「更新全部数据」")
@@ -568,12 +573,12 @@ with tab3:
     
     with col_stitch:
         st.write("**第2步：选择 ETF 并拼接**")
-        selected_etf = st.selectbox("选择要拼接的 ETF", list(ETF_CONFIG.keys()), key="stitch_etf")
+        selected_etf = st.selectbox("选择要拼接的 ETF", list(ACTIVE_ETF_CONFIG.keys()), key="stitch_etf")
         
         if uploaded_file and st.button("🔗 开始拼接 AkShare", use_container_width=True):
             if df_uploaded is not None:
                 with st.spinner("正在拼接数据..."):
-                    etf_code = ETF_CONFIG[selected_etf]['etf_code']
+                    etf_code = ACTIVE_ETF_CONFIG[selected_etf]['etf_code']
                     df_combined, scaling_factor, msg = stitch_with_akshare(df_uploaded, etf_code)
                     st.info(msg)
                     
@@ -590,7 +595,7 @@ with tab3:
                                 st.cache_data.clear()
     
     st.divider()
-    st.subheader("➕ 新增 ETF")
+    st.subheader("➕ 新增标的（必须绑定：指数历史文件 + ETF代码）")
     
     col_name, col_code = st.columns(2)
     
@@ -598,15 +603,37 @@ with tab3:
         new_etf_name = st.text_input("ETF 名称", placeholder="例如：新etf指数")
     
     with col_code:
-        new_etf_code = st.text_input("ETF 代码", placeholder="例如：159999")
+        new_etf_code = st.text_input("关联 ETF 代码", placeholder="例如：159999")
+
+    new_history_file = st.file_uploader(
+        "上传该标的的指数历史文件（xlsx/xls/csv）",
+        type=['xlsx', 'xls', 'csv'],
+        key="new_target_history_file"
+    )
     
-    if st.button("➕ 添加到系统", use_container_width=True):
-        if new_etf_name and new_etf_code:
-            ETF_CONFIG[new_etf_name] = {
-                "name": new_etf_name,
-                "etf_code": new_etf_code
-            }
-            st.success(f"✅ 已添加 {new_etf_name} ({new_etf_code})，刷新页面生效")
-            st.rerun()
+    if st.button("➕ 绑定并导入", use_container_width=True, type="primary"):
+        target_name = (new_etf_name or "").strip()
+        target_code = (new_etf_code or "").strip()
+
+        if not target_name or not target_code or new_history_file is None:
+            st.error("❌ 新增标的必须同时提供：标的名称、ETF代码、指数历史文件")
+        elif target_name in ACTIVE_ETF_CONFIG:
+            st.error(f"❌ 标的 {target_name} 已存在，请更换名称")
         else:
-            st.error("❌ 请填写完整的 ETF 名称和代码")
+            df_new, parse_msg = parse_upload_file(new_history_file)
+            st.info(parse_msg)
+            if df_new is not None:
+                with st.spinner("正在按绑定关系拼接并入库..."):
+                    df_combined, scaling_factor, stitch_msg = stitch_with_akshare(df_new, target_code)
+                    st.info(stitch_msg)
+
+                    if df_combined is not None:
+                        SCALING_FACTOR[target_code] = scaling_factor
+                        save_to_db(df_combined, target_code)
+                        ACTIVE_ETF_CONFIG[target_name] = {
+                            "name": target_name,
+                            "etf_code": target_code,
+                        }
+                        st.cache_data.clear()
+                        st.success(f"✅ 已新增标的并完成绑定：{target_name} ↔ {target_code}，且历史数据已入库")
+                        st.rerun()
