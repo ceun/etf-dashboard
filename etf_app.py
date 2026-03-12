@@ -1,6 +1,7 @@
 import os
 import socket
 import psycopg2
+from psycopg2.extras import execute_values
 import warnings
 import numpy as np
 import pandas as pd
@@ -146,18 +147,47 @@ def save_prices_to_db(df, etf_code):
         return
     try:
         cur = conn.cursor()
-        for _, row in df.iterrows():
-            ic = float(row['index_close']) if 'index_close' in df.columns and pd.notna(row.get('index_close')) else None
-            ec = float(row['etf_close'])   if 'etf_close'   in df.columns and pd.notna(row.get('etf_close'))   else None
-            cc = float(row['combined_close'])
-            cur.execute("""
-                INSERT INTO etf_prices (etf_code, date, index_close, etf_close, combined_close)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (etf_code, date) DO UPDATE SET
-                    index_close    = COALESCE(EXCLUDED.index_close, etf_prices.index_close),
-                    etf_close      = COALESCE(EXCLUDED.etf_close,   etf_prices.etf_close),
-                    combined_close = EXCLUDED.combined_close
-            """, (etf_code, row['Date'].date(), ic, ec, cc))
+
+        # 统一列，避免逐行 SQL 循环造成长时间阻塞
+        work = df.copy()
+        if 'index_close' not in work.columns:
+            work['index_close'] = None
+        if 'etf_close' not in work.columns:
+            work['etf_close'] = None
+
+        work['Date'] = pd.to_datetime(work['Date'])
+        work['index_close'] = pd.to_numeric(work['index_close'], errors='coerce')
+        work['etf_close'] = pd.to_numeric(work['etf_close'], errors='coerce')
+        work['combined_close'] = pd.to_numeric(work['combined_close'], errors='coerce')
+
+        rows = []
+        for _, row in work[['Date', 'index_close', 'etf_close', 'combined_close']].iterrows():
+            rows.append((
+                etf_code,
+                row['Date'].date(),
+                None if pd.isna(row['index_close']) else float(row['index_close']),
+                None if pd.isna(row['etf_close']) else float(row['etf_close']),
+                float(row['combined_close']),
+            ))
+
+        if not rows:
+            cur.close()
+            return
+
+        sql = """
+            INSERT INTO etf_prices (etf_code, date, index_close, etf_close, combined_close)
+            VALUES %s
+            ON CONFLICT (etf_code, date) DO UPDATE SET
+                index_close    = COALESCE(EXCLUDED.index_close, etf_prices.index_close),
+                etf_close      = COALESCE(EXCLUDED.etf_close,   etf_prices.etf_close),
+                combined_close = EXCLUDED.combined_close
+        """
+
+        # 分批写入，兼顾性能和语句体积
+        batch_size = 1000
+        for i in range(0, len(rows), batch_size):
+            execute_values(cur, sql, rows[i:i + batch_size])
+
         conn.commit()
         cur.close()
     except Exception as e:
@@ -400,16 +430,17 @@ def build_comparison(deviation_pct, etf_config):
 def parse_upload_file(uploaded_file):
     """解析 Excel/CSV 文件，返回 (DataFrame, message)"""
     try:
+        # parse_dates=False 阻止 pandas 自动转换日期，避免后续误判
         if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
+            df = pd.read_csv(uploaded_file, parse_dates=False)
         else:
-            df = pd.read_excel(uploaded_file)
+            df = pd.read_excel(uploaded_file, parse_dates=False)
         
         # 智能检测日期和收盘列
         date_col = None
         close_col = None
         for col in df.columns:
-            col_lower = col.lower()
+            col_lower = str(col).lower()
             if '日期' in col_lower or 'date' in col_lower or col_lower == '时间':
                 date_col = col
             if '收盘' in col_lower or 'close' in col_lower or '点位' in col_lower:
@@ -419,48 +450,60 @@ def parse_upload_file(uploaded_file):
             return None, f"❌ 无法识别日期列或收盘列。找到的列: {list(df.columns)}"
         
         df = df[[date_col, close_col]].rename(columns={date_col: 'Date', close_col: 'Close'})
-
-        # 兼容多种日期格式，避免数字日期被错误解析成 1970 年。
         raw_date = df['Date']
-        parsed_date = pd.to_datetime(raw_date, errors='coerce')
 
-        numeric_raw = pd.to_numeric(raw_date, errors='coerce')
-        need_fix = parsed_date.isna() & numeric_raw.notna()
+        # ── 情况1：pandas 读出的已经是 datetime / Timestamp 类型 ──────────────
+        if pd.api.types.is_datetime64_any_dtype(raw_date):
+            parsed_date = raw_date
+        else:
+            # ── 情况2：字符串或数字，需要手动解析 ───────────────────────────────
+            numeric_raw  = pd.to_numeric(raw_date, errors='coerce')
+            parsed_date  = pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns]')
 
-        if need_fix.any():
-            n = numeric_raw[need_fix]
-            fixed = pd.Series(pd.NaT, index=n.index, dtype='datetime64[ns]')
-
-            # Excel 序列日期（天数）
-            excel_mask = (n >= 20000) & (n <= 80000)
-            if excel_mask.any():
-                fixed.loc[excel_mask] = pd.to_datetime(
-                    n.loc[excel_mask], unit='D', origin='1899-12-30', errors='coerce'
+            # 文本日期（如 "2020-01-01" / "2020/01/01" / "20200101"）
+            text_mask = numeric_raw.isna()
+            if text_mask.any():
+                parsed_date.loc[text_mask] = pd.to_datetime(
+                    raw_date.loc[text_mask], infer_datetime_format=True, errors='coerce'
                 )
 
-            # 形如 20240311 的 YYYYMMDD 数字日期
-            ymd_mask = (n >= 19000101) & (n <= 21001231)
-            if ymd_mask.any():
-                ymd_str = n.loc[ymd_mask].round().astype('Int64').astype(str)
-                fixed.loc[ymd_mask] = pd.to_datetime(ymd_str, format='%Y%m%d', errors='coerce')
+            # 数字日期：按量级判断类型，完全避免 1970 误判
+            num_mask = numeric_raw.notna()
+            if num_mask.any():
+                n = numeric_raw.loc[num_mask]
+                fixed = pd.Series(pd.NaT, index=n.index, dtype='datetime64[ns]')
 
-            # Unix 时间戳（秒 / 毫秒）
-            sec_mask = (n >= 1_000_000_000) & (n < 10_000_000_000)
-            if sec_mask.any():
-                fixed.loc[sec_mask] = pd.to_datetime(n.loc[sec_mask], unit='s', errors='coerce')
+                # YYYYMMDD 整数（优先匹配，避免与 Excel 序列号混淆）
+                ymd_mask = (n >= 19000101) & (n <= 21001231)
+                if ymd_mask.any():
+                    ymd_str = n.loc[ymd_mask].round().astype('Int64').astype(str)
+                    fixed.loc[ymd_mask] = pd.to_datetime(
+                        ymd_str, format='%Y%m%d', errors='coerce'
+                    )
 
-            ms_mask = (n >= 1_000_000_000_000) & (n < 10_000_000_000_000)
-            if ms_mask.any():
-                fixed.loc[ms_mask] = pd.to_datetime(n.loc[ms_mask], unit='ms', errors='coerce')
+                # Excel 序列日期（1900-2100 对应 ~14000–73050 天）
+                excel_mask = (n >= 14000) & (n <= 80000) & ~ymd_mask
+                if excel_mask.any():
+                    fixed.loc[excel_mask] = pd.to_datetime(
+                        n.loc[excel_mask], unit='D', origin='1899-12-30', errors='coerce'
+                    )
 
-            parsed_date.loc[need_fix] = fixed
+                parsed_date.loc[num_mask] = fixed
 
-        df['Date'] = parsed_date
+        df['Date']  = pd.to_datetime(parsed_date, errors='coerce')
         df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-        df = df.dropna()
+        df = df.dropna(subset=['Date', 'Close'])
         df = df.sort_values('Date').reset_index(drop=True)
-        
-        return df, f"✅ 成功解析 {len(df)} 条数据"
+
+        # 合理性检查：日期应在 1990 年之后
+        bad = (df['Date'].dt.year < 1990).sum()
+        if bad > 0:
+            return None, (
+                f"❌ 检测到 {bad} 条日期早于 1990 年（可能解析错误），"
+                f"请检查文件格式。首行日期原始值: {raw_date.iloc[0]!r}"
+            )
+
+        return df, f"✅ 成功解析 {len(df)} 条数据（{df['Date'].min().date()} ~ {df['Date'].max().date()}）"
     except Exception as e:
         return None, f"❌ 解析文件出错: {e}"
 
