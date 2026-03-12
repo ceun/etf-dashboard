@@ -471,32 +471,31 @@ def stitch_with_akshare(history_df, etf_code):
     返回 (structured_df, scaling_factor, stitch_date, message)
     structured_df 列：Date, index_close, etf_close, combined_close
     
-    逻辑：
-    1. 外连接历史和AkShare数据
-    2. 找最后一个"两个值都有"的日期作为锚点计算缩放比例
-    3. 如果无重叠，返回错误
-    4. 拼接：历史全部 + 近期AkShare独有部分
+    注意：本函数用于「已有标的：上传并拼接」流程，需要自动从AkShare拉取数据。
     """
     try:
         ak_df = fetch_all_from_akshare(etf_code)
 
-        # 外连接，保留所有日期
+        # 外连接历史和AkShare
         merged = pd.merge(
             history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}),
             ak_df.rename(columns={'ETF_Close': 'etf_close'}),
             on='Date', how='outer',
         ).sort_values('Date')
 
-        # 找最后一个两列都有值的日期（锚点）
+        # 找最后一个两列都有值的日期（锚点）来计算缩放比例，找不到就用1.0
         overlap = merged[merged['index_close'].notna() & merged['etf_close'].notna()]
-        if overlap.empty:
-            return None, 1.0, None, "❌ 历史数据与 AkShare 无重叠日期，无法计算缩放比例"
+        if not overlap.empty:
+            anchor         = overlap.iloc[-1]
+            scaling_factor = float(anchor['index_close']) / float(anchor['etf_close'])
+            stitch_date    = anchor['Date'].date()
+            msg_prefix = f"✅ 拼接成功，缩放比例: {scaling_factor:.4f}"
+        else:
+            scaling_factor = 1.0
+            stitch_date    = history_df['Date'].max().date()
+            msg_prefix = "⚠️ 历史数据与 AkShare 无重叠日期，缩放比例暂设为 1.0"
 
-        anchor         = overlap.iloc[-1]
-        scaling_factor = float(anchor['index_close']) / float(anchor['etf_close'])
-        stitch_date    = anchor['Date'].date()
-
-        # 历史段：按原顺序包含历史数据的所有日期
+        # 历史段：所有历史日期（index_close有值）
         hist = history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}).copy()
         hist = pd.merge(hist, ak_df.rename(columns={'ETF_Close': 'etf_close'}), on='Date', how='left')
         hist['combined_close'] = hist['index_close']
@@ -515,7 +514,7 @@ def stitch_with_akshare(history_df, etf_code):
         ).sort_values('Date').reset_index(drop=True)
 
         return result, scaling_factor, stitch_date, \
-               f"✅ 拼接成功，缩放比例: {scaling_factor:.4f}，锚点日期: {stitch_date}，新增近期 {len(recent)} 条"
+               msg_prefix + f"，新增近期 {len(recent)} 条"
     except Exception as e:
         return None, 1.0, None, f"❌ 拼接失败: {e}"
 
@@ -723,6 +722,7 @@ with tab3:
 
     else:
         st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数历史文件，三者必填）")
+        st.caption("说明：新增时只保存指数历史数据，缩放比例暂设为 1.0；后续可在「已有标的：上传并拼接」中重新拉取 AkShare 数据计算正确的缩放比例。")
 
         col_name, col_code = st.columns(2)
         with col_name:
@@ -749,18 +749,24 @@ with tab3:
                 st.info(parse_msg)
 
                 if df_new is not None:
-                    with st.spinner("正在拼接并入库..."):
-                        df_combined, scaling_factor, stitch_date, stitch_msg = stitch_with_akshare(df_new, target_code)
-                    st.info(stitch_msg)
-
-                    if df_combined is not None:
-                        save_target_to_db(target_code, target_name, scaling_factor=scaling_factor, stitch_date=stitch_date)
-                        save_prices_to_db(df_combined, target_code)
+                    with st.spinner("正在保存指数历史数据..."):
+                        # 直接保存历史数据，不调用 stitch_with_akshare（避免依赖AkShare重叠）
+                        # 构建 etf_prices 表的数据格式（只有指数数据）
+                        df_to_save = df_new[['Date', 'Close']].copy()
+                        df_to_save['index_close']    = df_to_save['Close']
+                        df_to_save['etf_close']      = None
+                        df_to_save['combined_close'] = df_to_save['Close']
+                        
+                        # 保存元数据和价格数据
+                        save_target_to_db(target_code, target_name, scaling_factor=1.0, stitch_date=df_new['Date'].max().date())
+                        save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close', 'combined_close']], target_code)
+                        
                         st.session_state["etf_config_runtime"][target_name] = {
                             "name": target_name,
                             "etf_code": target_code,
-                            "scaling_factor": scaling_factor,
+                            "scaling_factor": 1.0,
                         }
                         st.cache_data.clear()
-                        st.success(f"✅ 已新增：{target_name} ↔ {target_code}，历史数据已入库")
+                        st.success(f"✅ 已新增：{target_name} ↔ {target_code}，指数历史数据已保存（缩放比例暂设为 1.0）")
+                        st.info("💡 后续可在「已有标的：上传并拼接」中上传更新的数据并重新计算正确的缩放比例")
                         st.rerun()
