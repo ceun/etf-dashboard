@@ -470,29 +470,38 @@ def stitch_with_akshare(history_df, etf_code):
     将历史指数数据（history_df: Date, Close=指数点位）与 AkShare ETF 数据拼接。
     返回 (structured_df, scaling_factor, stitch_date, message)
     structured_df 列：Date, index_close, etf_close, combined_close
+    
+    逻辑：
+    1. 外连接历史和AkShare数据
+    2. 找最后一个"两个值都有"的日期作为锚点计算缩放比例
+    3. 如果无重叠，返回错误
+    4. 拼接：历史全部 + 近期AkShare独有部分
     """
     try:
         ak_df = fetch_all_from_akshare(etf_code)
 
-        # 找重叠段，以最后一个重叠日作为锚点
+        # 外连接，保留所有日期
         merged = pd.merge(
             history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}),
             ak_df.rename(columns={'ETF_Close': 'etf_close'}),
-            on='Date', how='inner',
-        )
-        if merged.empty:
+            on='Date', how='outer',
+        ).sort_values('Date')
+
+        # 找最后一个两列都有值的日期（锚点）
+        overlap = merged[merged['index_close'].notna() & merged['etf_close'].notna()]
+        if overlap.empty:
             return None, 1.0, None, "❌ 历史数据与 AkShare 无重叠日期，无法计算缩放比例"
 
-        anchor        = merged.iloc[-1]
+        anchor         = overlap.iloc[-1]
         scaling_factor = float(anchor['index_close']) / float(anchor['etf_close'])
-        stitch_date   = anchor['Date'].date()
+        stitch_date    = anchor['Date'].date()
 
-        # 历史段（含重叠）：combined_close = index_close（以指数点位为准）
+        # 历史段：按原顺序包含历史数据的所有日期
         hist = history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}).copy()
         hist = pd.merge(hist, ak_df.rename(columns={'ETF_Close': 'etf_close'}), on='Date', how='left')
         hist['combined_close'] = hist['index_close']
 
-        # 近期段：AkShare 独有日期（晚于历史最新日期），combined_close = etf_close * scaling_factor
+        # 近期段：AkShare 独有日期（晚于历史最新日期）
         last_hist = history_df['Date'].max()
         recent = ak_df[ak_df['Date'] > last_hist].copy()
         recent = recent.rename(columns={'ETF_Close': 'etf_close'})
@@ -506,7 +515,7 @@ def stitch_with_akshare(history_df, etf_code):
         ).sort_values('Date').reset_index(drop=True)
 
         return result, scaling_factor, stitch_date, \
-               f"✅ 拼接成功，缩放比例: {scaling_factor:.4f}，新增近期 {len(recent)} 条"
+               f"✅ 拼接成功，缩放比例: {scaling_factor:.4f}，锚点日期: {stitch_date}，新增近期 {len(recent)} 条"
     except Exception as e:
         return None, 1.0, None, f"❌ 拼接失败: {e}"
 
