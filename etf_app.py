@@ -522,14 +522,14 @@ def render_native_charts(res, etf_name, deviation_pct):
     band_upper = np.exp(df['Trad_Pred_Log'] + 2 * std_trad)
     band_lower = np.exp(df['Trad_Pred_Log'] - 2 * std_trad)
 
-    # ── 配色（参照图片：柔和蓝/橙，白底）─────────────────────────────
-    C_INDEX  = '#2E4057'   # 深蓝黑 - 指数主线
-    C_TRAD   = '#E76F51'   # 暖橙   - 传统回归
-    C_ROLL   = '#4EA8DE'   # 天蓝   - 滚动回归
-    C_BAND   = 'rgba(231,111,81,0.12)'  # 置信带填充
-    C_TZERO  = '#888888'
-    C_SIGMA  = '#E76F51'
-    C_THRESH = '#F4A261'
+    # ── 配色（海洋清风）────────────────────────────────────────────
+    C_INDEX  = '#51999F'   # 海蓝绿 - 指数主线
+    C_TRAD   = '#ED8D5A'   # 柔橙   - 传统回归
+    C_ROLL   = '#4198AC'   # 湖蓝   - 滚动回归
+    C_BAND   = 'rgba(236,182,108,0.16)'  # 暖沙色置信带
+    C_TZERO  = '#7C9A9E'
+    C_SIGMA  = '#EA9E58'
+    C_THRESH = '#DBCB92'
 
     fig = make_subplots(
         rows=2, cols=1,
@@ -552,7 +552,7 @@ def render_native_charts(res, etf_name, deviation_pct):
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Trad_Pred_Price'],
         name=f'传统回归 ({TRADITION_START[:4]}–{TRADITION_END[:4]})',
-        line=dict(color=C_TRAD, width=2, dash='dash'),
+        line=dict(color=C_TRAD, width=1.4, dash='dash'),
         hovertemplate='%{x|%Y-%m-%d}  传统: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
 
@@ -560,26 +560,26 @@ def render_native_charts(res, etf_name, deviation_pct):
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Roll_Pred_Price'],
         name=f'滚动回归 ({ROLLING_WINDOW}日)',
-        line=dict(color=C_ROLL, width=2, dash='dot'),
+        line=dict(color=C_ROLL, width=1.4, dash='dashdot'),
         hovertemplate='%{x|%Y-%m-%d}  滚动: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
 
     # ── 指数主线（最顶层）────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Close'],
-        name='指数', line=dict(color=C_INDEX, width=1.8),
+        name='指数', line=dict(color=C_INDEX, width=1.3),
         hovertemplate='%{x|%Y-%m-%d}  指数: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
 
     # ── Z-Score 主线 ──────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Roll_Z_Score'],
-        name='滚动Z', line=dict(color=C_ROLL, width=1.5),
+        name='滚动Z', line=dict(color=C_ROLL, width=1.2, dash='dashdot'),
         hovertemplate='%{x|%Y-%m-%d}  滚动Z: %{y:.3f}<extra></extra>',
     ), row=2, col=1)
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Trad_Z_Score'],
-        name='传统Z', line=dict(color=C_INDEX, width=2),
+        name='传统Z', line=dict(color=C_INDEX, width=1.3),
         hovertemplate='%{x|%Y-%m-%d}  传统Z: %{y:.3f}<extra></extra>',
     ), row=2, col=1)
 
@@ -593,7 +593,7 @@ def render_native_charts(res, etf_name, deviation_pct):
     ]:
         fig.add_hline(
             y=y_val, row=2, col=1,
-            line=dict(color=color, width=1.2, dash=dash),
+            line=dict(color=color, width=1.0, dash=dash),
             annotation_text=label,
             annotation_font=dict(size=11, color=color),
             annotation_position='right',
