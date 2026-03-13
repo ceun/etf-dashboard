@@ -11,6 +11,11 @@ import akshare as ak
 import streamlit as st
 from urllib.parse import urlparse, parse_qs, unquote
 
+try:
+    import baostock as bs
+except Exception:
+    bs = None
+
 warnings.filterwarnings('ignore')
 
 # ─── 页面配置 ────────────────────────────────────────────────────────────────
@@ -235,6 +240,107 @@ def fetch_all_from_akshare(etf_code):
     return df.sort_values('Date').reset_index(drop=True)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_latest_ak_hfq_unadj(etf_code):
+    """返回 AkShare 最新 (hfq, unadj) 收盘价，用于对齐显示口径。"""
+    hfq_raw = ak.fund_etf_hist_em(symbol=etf_code, period="daily", adjust="hfq")
+    unadj_raw = ak.fund_etf_hist_em(symbol=etf_code, period="daily", adjust="")
+    hfq_latest = float(hfq_raw.sort_values('日期').iloc[-1]['收盘'])
+    unadj_latest = float(unadj_raw.sort_values('日期').iloc[-1]['收盘'])
+    return hfq_latest, unadj_latest
+
+
+def _to_baostock_code(etf_code):
+    s = str(etf_code).strip()
+    if s.startswith(('5', '6', '9')):
+        return f"sh.{s}"
+    return f"sz.{s}"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_unadj_factor_from_baostock(etf_code):
+    """
+    使用 baostock query_adjust_factor 估算“后复权 -> 不复权”的换算系数。
+    返回 (factor, source_msg)，其中 factor 满足: unadj ~= hfq * factor。
+    """
+    # 先拿 AkShare 比值做方向校准（避免因子方向理解差异）
+    ak_ratio = None
+    try:
+        hfq_latest, unadj_latest = fetch_latest_ak_hfq_unadj(etf_code)
+        if hfq_latest > 0:
+            ak_ratio = unadj_latest / hfq_latest
+    except Exception:
+        ak_ratio = None
+
+    if bs is None:
+        if ak_ratio is not None:
+            return float(ak_ratio), "akshare-fallback"
+        return 1.0, "no-baostock"
+
+    login_res = bs.login()
+    if getattr(login_res, 'error_code', '1') != '0':
+        if ak_ratio is not None:
+            return float(ak_ratio), "akshare-fallback"
+        return 1.0, "baostock-login-failed"
+
+    try:
+        bs_code = _to_baostock_code(etf_code)
+        rs = bs.query_adjust_factor(
+            code=bs_code,
+            start_date="1990-01-01",
+            end_date=pd.Timestamp.today().strftime('%Y-%m-%d'),
+        )
+        rows = []
+        while rs.error_code == '0' and rs.next():
+            rows.append(rs.get_row_data())
+
+        if not rows:
+            if ak_ratio is not None:
+                return float(ak_ratio), "akshare-fallback"
+            return 1.0, "baostock-empty"
+
+        df_factor = pd.DataFrame(rows, columns=rs.fields)
+        if 'dividOperateDate' in df_factor.columns:
+            df_factor['dividOperateDate'] = pd.to_datetime(df_factor['dividOperateDate'], errors='coerce')
+            latest = df_factor.sort_values('dividOperateDate').iloc[-1]
+        else:
+            latest = df_factor.iloc[-1]
+
+        raw = None
+        for col in ('backAdjustFactor', 'adjustFactor', 'foreAdjustFactor'):
+            if col in df_factor.columns and pd.notna(latest.get(col)):
+                raw = pd.to_numeric(latest.get(col), errors='coerce')
+                if pd.notna(raw):
+                    raw = float(raw)
+                    break
+
+        if raw is None or raw <= 0:
+            if ak_ratio is not None:
+                return float(ak_ratio), "akshare-fallback"
+            return 1.0, "baostock-invalid"
+
+        cand_mul = raw
+        cand_div = 1.0 / raw
+
+        # 用 AkShare 当日比值选择更合理方向
+        if ak_ratio is not None:
+            if abs(cand_mul - ak_ratio) <= abs(cand_div - ak_ratio):
+                return float(cand_mul), "baostock"
+            return float(cand_div), "baostock"
+
+        # 无法校准时优先使用 1/raw（常见情形：hfq = unadj * factor）
+        return float(cand_div), "baostock"
+    except Exception:
+        if ak_ratio is not None:
+            return float(ak_ratio), "akshare-fallback"
+        return 1.0, "baostock-exception"
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+
 def _incremental_akshare_update(etf_code, scaling_factor):
     """增量拉取 AkShare 新数据追加到 etf_prices（新行：index_close=NULL）"""
     conn = get_db_connection()
@@ -288,7 +394,7 @@ def get_data(etf_code: str):
 
 
 # ─── 核心分析 ─────────────────────────────────────────────────────────────────
-def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0):
+def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0, unadj_factor=1.0):
     df = df.copy()
     df['Log_Close'] = np.log(df['Close'])
     df['Time_Idx']  = np.arange(len(df))
@@ -372,20 +478,27 @@ def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0):
     latest_close = float(df['Close'].iloc[-1])
     trad_pred    = float(df['Trad_Pred_Price'].iloc[-1])
     roll_pred    = float(df['Roll_Pred_Price'].iloc[-1])
+
+    # 展示口径：指数点位 -> 后复权ETF -> 不复权ETF
+    def to_unadj_etf(point_value):
+        if scaling_factor > 0:
+            return point_value / scaling_factor * unadj_factor
+        return point_value
     
     return fig, {
         "latest_date":  df['Date'].iloc[-1].strftime('%Y-%m-%d'),
         "latest_close": latest_close,
-        "latest_etf_price": latest_close / scaling_factor if scaling_factor > 0 else latest_close,
+        "latest_etf_price": to_unadj_etf(latest_close),
         "trad_pred":    trad_pred,
-        "trad_pred_etf": trad_pred / scaling_factor if scaling_factor > 0 else trad_pred,
+        "trad_pred_etf": to_unadj_etf(trad_pred),
         "roll_pred":    roll_pred,
-        "roll_pred_etf": roll_pred / scaling_factor if scaling_factor > 0 else roll_pred,
+        "roll_pred_etf": to_unadj_etf(roll_pred),
         "dev_trad":     (latest_close / trad_pred - 1) * 100,
         "dev_roll":     (latest_close / roll_pred - 1) * 100,
         "cagr_trad":    (np.exp(k_trad * 252) - 1) * 100,
         "cagr_roll":    (np.exp(k_roll_last * 252) - 1) * 100,
         "scaling_factor": scaling_factor,
+        "unadj_factor": unadj_factor,
     }
 
 
@@ -642,9 +755,15 @@ with tab1:
             st.error("数据不足，无法计算回归，请先在「数据管理」中上传历史指数文件并拼接。")
         else:
             try:
-                fig, res = compute_and_plot(df, etf_name, deviation_pct, scaling_factor)
+                unadj_factor, factor_source = get_unadj_factor_from_baostock(etf_code)
+                fig, res = compute_and_plot(df, etf_name, deviation_pct, scaling_factor, unadj_factor)
                 st.pyplot(fig)
                 plt.close(fig)
+
+                if factor_source != "baostock":
+                    st.caption(f"ETF价格展示口径：不复权（因子来源: {factor_source}）")
+                else:
+                    st.caption("ETF价格展示口径：不复权（因子来源: baostock query_adjust_factor）")
 
                 st.divider()
                 st.subheader("指数点位 & ETF价格")
