@@ -615,7 +615,12 @@ def render_native_charts(res, etf_name, deviation_pct):
         **axis_common,
     )
     fig.update_yaxes(title_text='Z-Score',                 row=2, col=1, **axis_common)
-    fig.update_xaxes(**axis_common)
+    fig.update_xaxes(
+        dtick='M12',
+        tickformat='%Y',
+        ticklabelmode='instant',
+        **axis_common,
+    )
     fig.update_layout(
         height=720,
         hovermode='x unified',
