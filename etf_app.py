@@ -21,7 +21,7 @@ except Exception:
 warnings.filterwarnings('ignore')
 
 # ─── 页面配置 ────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="ETF估值", page_icon="📈", layout="wide")
+st.set_page_config(page_title="今天买什么", page_icon="📈", layout="wide")
 
 # ─── 全局配置 ────────────────────────────────────────────────────────────────
 TRADITION_START = "20081031"
@@ -925,7 +925,7 @@ def stitch_with_akshare(history_df, etf_code):
 
 
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
-st.title("📈 ETF 回归估值仪表板")
+st.title("📈 今天买什么")
 
 if "etf_config_runtime" not in st.session_state:
     st.session_state["etf_config_runtime"] = load_targets_from_db()
@@ -1024,14 +1024,14 @@ with tab1:
                 st.subheader("传统回归")
                 c4, c5, c6, c7 = st.columns(4)
                 c4.metric("点位", f"{res['trad_pred']:,.0f}")
-                c5.metric("ETF价", f"{res['trad_pred_etf']:.4f}")
+                c5.metric("预估价格", f"{res['trad_pred_etf']:.4f}")
                 c6.metric("偏离度", f"{res['dev_trad']:+.2f}%", delta_color="inverse")
                 c7.metric("年化收益", f"{res['cagr_trad']:.2f}%")
 
                 st.subheader("滚动回归")
                 c8, c9, c10, c11 = st.columns(4)
                 c8.metric("点位", f"{res['roll_pred']:,.0f}")
-                c9.metric("ETF价", f"{res['roll_pred_etf']:.4f}")
+                c9.metric("预估价格", f"{res['roll_pred_etf']:.4f}")
                 c10.metric("偏离度", f"{res['dev_roll']:+.2f}%", delta_color="inverse")
                 c11.metric("年化收益", f"{res['cagr_roll']:.2f}%")
             except Exception as e:
