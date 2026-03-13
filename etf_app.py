@@ -343,6 +343,88 @@ def get_unadj_factor_from_baostock(etf_code):
             pass
 
 
+def _check_needs_full_stitch(etf_code):
+    """检查标的是否需要完整拼接（历史数据 etf_close 全为 NULL 但 index_close 有值）"""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        res = pd.read_sql(
+            """SELECT 
+                COUNT(CASE WHEN index_close IS NOT NULL THEN 1 END) AS has_index,
+                COUNT(CASE WHEN etf_close IS NOT NULL THEN 1 END) AS has_etf
+            FROM etf_prices WHERE etf_code=%s""",
+            conn, params=(etf_code,),
+        )
+        conn.close()
+        if res.empty:
+            return False
+        has_index = res.iloc[0]['has_index'] > 0
+        has_etf = res.iloc[0]['has_etf'] == 0
+        return has_index and has_etf  # 有指数数据但 etf_close 全为 NULL
+    except Exception:
+        return False
+
+
+def _full_stitch_from_db(etf_code):
+    """完整拼接：从 DB 读取 index_close 数据，拉取 AkShare 全量，计算 scaling_factor 并更新所有行"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        
+        # 读取 DB 中已有的 index_close 数据
+        df_hist = pd.read_sql(
+            "SELECT date, index_close FROM etf_prices WHERE etf_code=%s AND index_close IS NOT NULL ORDER BY date",
+            conn, params=(etf_code,),
+        )
+        conn.close()
+        
+        if df_hist.empty:
+            return False
+        
+        df_hist['Date'] = pd.to_datetime(df_hist['date'])
+        df_hist = df_hist.rename(columns={'index_close': 'index_close_val'})[['Date', 'index_close_val']]
+        
+        # 拉取 AkShare 完整历史
+        ak_df = fetch_all_from_akshare(etf_code)
+        
+        # 查找重叠日期计算缩放比例
+        merged = pd.merge(df_hist, ak_df, on='Date', how='inner')
+        if merged.empty:
+            return False
+        
+        anchor = merged.iloc[-1]
+        scaling_factor = float(anchor['index_close_val']) / float(anchor['ETF_Close'])
+        stitch_date = anchor['Date'].date()
+        
+        # 构造拼接结果：历史段 + 新增段
+        hist_part = df_hist.copy()
+        hist_part = pd.merge(hist_part, ak_df, on='Date', how='left')
+        hist_part = hist_part.rename(columns={'index_close_val': 'index_close', 'ETF_Close': 'etf_close'})
+        hist_part['combined_close'] = hist_part['index_close']
+        
+        last_hist_date = df_hist['Date'].max()
+        new_part = ak_df[ak_df['Date'] > last_hist_date].copy()
+        new_part = new_part.rename(columns={'ETF_Close': 'etf_close'})
+        new_part['index_close'] = None
+        new_part['combined_close'] = new_part['etf_close'] * scaling_factor
+        
+        result = pd.concat(
+            [hist_part[['Date', 'index_close', 'etf_close', 'combined_close']],
+             new_part[['Date', 'index_close', 'etf_close', 'combined_close']]],
+            ignore_index=True,
+        ).sort_values('Date').reset_index(drop=True)
+        
+        # 更新 DB
+        save_prices_to_db(result, etf_code)
+        save_target_to_db(etf_code, etf_code, scaling_factor=scaling_factor, stitch_date=stitch_date)
+        
+        return True
+    except Exception as e:
+        return False
+
+
 def _incremental_akshare_update(etf_code, scaling_factor):
     """增量拉取 AkShare 新数据追加到 etf_prices（新行：index_close=NULL）"""
     conn = get_db_connection()
@@ -372,7 +454,7 @@ def _incremental_akshare_update(etf_code, scaling_factor):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_data(etf_code: str):
     """
-    DB 优先 → 增量 AkShare 更新 → 返回 (df[Date, Close], scaling_factor)
+    DB 优先 → 检查拼接状态 → (完整拼接 或 增量更新) → 返回 (df[Date, Close], scaling_factor)
     若 DB 无数据，全量拉 AkShare（scaling_factor=1.0，需后续上传指数文件重新拼接）。
     """
     df, scaling_factor = load_from_db(etf_code)
@@ -390,8 +472,13 @@ def get_data(etf_code: str):
         df['Close'] = raw['ETF_Close'].values
         scaling_factor = 1.0
     else:
-        _incremental_akshare_update(etf_code, scaling_factor)
-        df, scaling_factor = load_from_db(etf_code)
+        # 检查是否需要完整拼接（历史数据未初始化 etf_close）
+        if _check_needs_full_stitch(etf_code):
+            _full_stitch_from_db(etf_code)
+            df, scaling_factor = load_from_db(etf_code)
+        else:
+            _incremental_akshare_update(etf_code, scaling_factor)
+            df, scaling_factor = load_from_db(etf_code)
     return df, scaling_factor
 
 
@@ -1026,7 +1113,7 @@ with tab3:
 
     else:
         st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数历史文件，三者必填）")
-        st.caption("说明：新增时只保存指数历史数据，缩放比例暂设为 1.0；后续可在「已有标的：上传并拼接」中重新拉取 AkShare 数据计算正确的缩放比例。")
+        st.caption("说明：新增时只保存指数历史数据；点击「更新全部数据」时会自动从 AkShare 拉取并拼接。")
 
         col_name, col_code = st.columns(2)
         with col_name:
@@ -1054,14 +1141,13 @@ with tab3:
 
                 if df_new is not None:
                     with st.spinner("正在保存指数历史数据..."):
-                        # 直接保存历史数据，不调用 stitch_with_akshare（避免依赖AkShare重叠）
-                        # 构建 etf_prices 表的数据格式（只有指数数据）
+                        # 直接保存指数历史，etf_close=NULL，等待更新全部数据时拼接
                         df_to_save = df_new[['Date', 'Close']].copy()
                         df_to_save['index_close']    = df_to_save['Close']
                         df_to_save['etf_close']      = None
                         df_to_save['combined_close'] = df_to_save['Close']
                         
-                        # 保存元数据和价格数据
+                        # 保存元数据和历史数据
                         save_target_to_db(target_code, target_name, scaling_factor=1.0, stitch_date=df_new['Date'].max().date())
                         save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close', 'combined_close']], target_code)
                         
@@ -1071,6 +1157,6 @@ with tab3:
                             "scaling_factor": 1.0,
                         }
                         st.cache_data.clear()
-                        st.success(f"✅ 已新增：{target_name} ↔ {target_code}，指数历史数据已保存（缩放比例暂设为 1.0）")
-                        st.info("💡 后续可在「已有标的：上传并拼接」中上传更新的数据并重新计算正确的缩放比例")
+                        st.success(f"✅ 已新增：{target_name} ↔ {target_code}，指数历史已保存")
+                        st.info("💡 点击「更新全部数据」会自动从 AkShare 拉取并拼接，计算正确的缩放比例")
                         st.rerun()
