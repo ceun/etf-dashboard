@@ -605,7 +605,16 @@ def render_native_charts(res, etf_name, deviation_pct):
         zeroline=False, showline=False,
         tickfont=dict(size=11),
     )
-    fig.update_yaxes(type='log', title_text='点位（对数）', row=1, col=1, **axis_common)
+    fig.update_yaxes(
+        type='log',
+        title_text='点位（对数）',
+        tickformat=',.0f',
+        dtick=1,
+        minorloglabels='none',
+        row=1,
+        col=1,
+        **axis_common,
+    )
     fig.update_yaxes(title_text='Z-Score',                 row=2, col=1, **axis_common)
     fig.update_xaxes(**axis_common)
     fig.update_layout(
