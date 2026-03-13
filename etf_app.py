@@ -1023,17 +1023,17 @@ with tab1:
 
                 st.subheader("传统回归")
                 c4, c5, c6, c7 = st.columns(4)
-                c4.metric("点位", f"{res['trad_pred']:,.0f}")
+                c4.metric("指数点位", f"{res['trad_pred']:,.0f}")
                 c5.metric("预估价格", f"{res['trad_pred_etf']:.4f}")
                 c6.metric("偏离度", f"{res['dev_trad']:+.2f}%", delta_color="inverse")
-                c7.metric("年化收益", f"{res['cagr_trad']:.2f}%")
+                c7.metric("年化", f"{res['cagr_trad']:.2f}%")
 
                 st.subheader("滚动回归")
                 c8, c9, c10, c11 = st.columns(4)
-                c8.metric("点位", f"{res['roll_pred']:,.0f}")
+                c8.metric("指数点位", f"{res['roll_pred']:,.0f}")
                 c9.metric("预估价格", f"{res['roll_pred_etf']:.4f}")
                 c10.metric("偏离度", f"{res['dev_roll']:+.2f}%", delta_color="inverse")
-                c11.metric("年化收益", f"{res['cagr_roll']:.2f}%")
+                c11.metric("年化", f"{res['cagr_roll']:.2f}%")
             except Exception as e:
                 st.error(f"计算出错：{e}")
 
@@ -1051,7 +1051,7 @@ with tab2:
             numeric_cols = ["传统偏离度(%)", "滚动偏离度(%)"]
             styled = compare_df.style.background_gradient(
                 subset=[c for c in numeric_cols if c in compare_df.columns],
-                cmap="coolwarm", vmin=-30, vmax=30,
+                cmap="coolwarm", vmin=-100, vmax=100,
             ).format({
                 "传统偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
                 "滚动偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
@@ -1062,9 +1062,9 @@ with tab2:
 
             plot_df = compare_df.dropna(subset=["传统偏离度(%)", "滚动偏离度(%)"])
             if not plot_df.empty:
-                st.subheader("偏离度可视化对比")
+                st.subheader("偏离度对比")
                 plot_df = plot_df.copy()
-                plot_df = plot_df.sort_values("滚动偏离度(%)", ascending=True)
+                plot_df = plot_df.sort_values("传统偏离度(%)", ascending=True)
 
                 fig2 = go.Figure()
                 fig2.add_trace(go.Bar(
