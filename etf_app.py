@@ -343,6 +343,24 @@ def get_unadj_factor_from_baostock(etf_code):
             pass
 
 
+def _get_target_name(etf_code, default_name=None):
+    """获取标的的真实 name，如果不存在则返回默认值"""
+    conn = get_db_connection()
+    if not conn:
+        return default_name or etf_code
+    try:
+        res = pd.read_sql(
+            "SELECT name FROM etf_targets WHERE etf_code=%s",
+            conn, params=(etf_code,),
+        )
+        conn.close()
+        if not res.empty and pd.notna(res.iloc[0]['name']):
+            return res.iloc[0]['name']
+        return default_name or etf_code
+    except Exception:
+        return default_name or etf_code
+
+
 def _check_needs_full_stitch(etf_code):
     """检查标的是否需要完整拼接（历史数据 etf_close 全为 NULL 但 index_close 有值）"""
     conn = get_db_connection()
@@ -418,7 +436,8 @@ def _full_stitch_from_db(etf_code):
         
         # 更新 DB
         save_prices_to_db(result, etf_code)
-        save_target_to_db(etf_code, etf_code, scaling_factor=scaling_factor, stitch_date=stitch_date)
+        target_name = _get_target_name(etf_code)
+        save_target_to_db(etf_code, target_name, scaling_factor=scaling_factor, stitch_date=stitch_date)
         
         return True
     except Exception as e:
@@ -460,7 +479,8 @@ def get_data(etf_code: str):
     df, scaling_factor = load_from_db(etf_code)
     if df is None:
         raw = fetch_all_from_akshare(etf_code)
-        save_target_to_db(etf_code, etf_code, scaling_factor=1.0)
+        target_name = _get_target_name(etf_code)
+        save_target_to_db(etf_code, target_name, scaling_factor=1.0)
         rows = pd.DataFrame({
             'Date':           raw['Date'],
             'index_close':    None,
