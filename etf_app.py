@@ -503,75 +503,130 @@ def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0, unadj_fact
         "unadj_factor": unadj_factor,
         "z_plus": z_plus,
         "z_minus": z_minus,
+        "std_trad": std_trad,
         "plot_df": df[[
             'Date', 'Close', 'Trad_Pred_Price', 'Roll_Pred_Price',
-            'Trad_Z_Score', 'Roll_Z_Score'
+            'Trad_Z_Score', 'Roll_Z_Score', 'Trad_Pred_Log',
         ]].copy(),
     }
 
 
 def render_native_charts(res, etf_name, deviation_pct):
-    """使用 Plotly 渲染，矢量级清晰度，支持缩放/悬停。"""
-    df = res['plot_df']
-    z_plus  = float(res['z_plus'])
-    z_minus = float(res['z_minus'])
+    """使用 Plotly 渲染，现代简洁风格，含置信带、对数坐标、悬停。"""
+    df       = res['plot_df'].copy()
+    z_plus   = float(res['z_plus'])
+    z_minus  = float(res['z_minus'])
+    std_trad = float(res['std_trad'])
+
+    # 传统回归置信带（对数空间 ±2σ）
+    band_upper = np.exp(df['Trad_Pred_Log'] + 2 * std_trad)
+    band_lower = np.exp(df['Trad_Pred_Log'] - 2 * std_trad)
+
+    # ── 配色（参照图片：柔和蓝/橙，白底）─────────────────────────────
+    C_INDEX  = '#2E4057'   # 深蓝黑 - 指数主线
+    C_TRAD   = '#E76F51'   # 暖橙   - 传统回归
+    C_ROLL   = '#4EA8DE'   # 天蓝   - 滚动回归
+    C_BAND   = 'rgba(231,111,81,0.12)'  # 置信带填充
+    C_TZERO  = '#888888'
+    C_SIGMA  = '#E76F51'
+    C_THRESH = '#F4A261'
 
     fig = make_subplots(
         rows=2, cols=1,
         row_heights=[0.65, 0.35],
         shared_xaxes=True,
-        vertical_spacing=0.06,
-        subplot_titles=[f'{etf_name} 全收益', 'Z-Score 偏离度'],
+        vertical_spacing=0.04,
+        subplot_titles=[f'{etf_name}  全收益指数', 'Z-Score 偏离度'],
     )
 
-    # ── 价格图（对数坐标）────────────────────────────────────────────
+    # ── 置信带（先画，让它垫在线条下面）─────────────────────────────
     fig.add_trace(go.Scatter(
-        x=df['Date'], y=df['Close'],
-        name='指数', line=dict(color='black', width=1.5),
-        hovertemplate='%{x|%Y-%m-%d}<br>指数: %{y:,.2f}<extra></extra>',
+        x=pd.concat([df['Date'], df['Date'][::-1]]),
+        y=pd.concat([band_upper, band_lower[::-1]]),
+        fill='toself', fillcolor=C_BAND,
+        line=dict(width=0), showlegend=True, name='传统通道 ±2σ',
+        hoverinfo='skip',
     ), row=1, col=1)
+
+    # ── 传统回归线（虚线）────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Trad_Pred_Price'],
-        name='传统回归', line=dict(color='red', width=2, dash='dash'),
-        hovertemplate='%{x|%Y-%m-%d}<br>传统回归: %{y:,.2f}<extra></extra>',
+        name=f'传统回归 ({TRADITION_START[:4]}–{TRADITION_END[:4]})',
+        line=dict(color=C_TRAD, width=2, dash='dash'),
+        hovertemplate='%{x|%Y-%m-%d}  传统: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
+
+    # ── 滚动回归线（点划线）──────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Roll_Pred_Price'],
-        name='滚动回归', line=dict(color='blue', width=1.5, dash='dashdot'),
-        hovertemplate='%{x|%Y-%m-%d}<br>滚动回归: %{y:,.2f}<extra></extra>',
+        name=f'滚动回归 ({ROLLING_WINDOW}日)',
+        line=dict(color=C_ROLL, width=2, dash='dot'),
+        hovertemplate='%{x|%Y-%m-%d}  滚动: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
 
-    # ── Z-Score 图──────────────────────────────────────────────────
+    # ── 指数主线（最顶层）────────────────────────────────────────────
     fig.add_trace(go.Scatter(
-        x=df['Date'], y=df['Trad_Z_Score'],
-        name='传统Z', line=dict(color='black', width=1.5),
-        hovertemplate='%{x|%Y-%m-%d}<br>传统Z: %{y:.3f}<extra></extra>',
-    ), row=2, col=1)
+        x=df['Date'], y=df['Close'],
+        name='指数', line=dict(color=C_INDEX, width=1.8),
+        hovertemplate='%{x|%Y-%m-%d}  指数: %{y:,.1f}<extra></extra>',
+    ), row=1, col=1)
+
+    # ── Z-Score 主线 ──────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Roll_Z_Score'],
-        name='滚动Z', line=dict(color='blue', width=1.2, dash='dot'),
-        hovertemplate='%{x|%Y-%m-%d}<br>滚动Z: %{y:.3f}<extra></extra>',
+        name='滚动Z', line=dict(color=C_ROLL, width=1.5),
+        hovertemplate='%{x|%Y-%m-%d}  滚动Z: %{y:.3f}<extra></extra>',
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=df['Date'], y=df['Trad_Z_Score'],
+        name='传统Z', line=dict(color=C_INDEX, width=2),
+        hovertemplate='%{x|%Y-%m-%d}  传统Z: %{y:.3f}<extra></extra>',
     ), row=2, col=1)
 
-    for y_val, color, label in [
-        (0,        'black',  '零轴'),
-        (2,        'red',    '+2σ'),
-        (-2,       'green',  '-2σ'),
-        (z_plus,   'orange', f'+{deviation_pct:.0f}%'),
-        (z_minus,  'orange', f'-{deviation_pct:.0f}%'),
+    # ── Z-Score 水平参考线 ────────────────────────────────────────
+    for y_val, color, dash, label in [
+        (0,       C_TZERO,  'solid',  ''),
+        (2,       C_SIGMA,  'dash',   '+2σ'),
+        (-2,      C_SIGMA,  'dash',   '-2σ'),
+        (z_plus,  C_THRESH, 'dot',    f'+{deviation_pct:.0f}%'),
+        (z_minus, C_THRESH, 'dot',    f'-{deviation_pct:.0f}%'),
     ]:
-        fig.add_hline(y=y_val, line=dict(color=color, width=1, dash='dot'),
-                      row=2, col=1, annotation_text=label,
-                      annotation_position='right')
+        fig.add_hline(
+            y=y_val, row=2, col=1,
+            line=dict(color=color, width=1.2, dash=dash),
+            annotation_text=label,
+            annotation_font=dict(size=11, color=color),
+            annotation_position='right',
+        )
 
-    fig.update_yaxes(type='log', row=1, col=1, title_text='点位（对数）')
-    fig.update_yaxes(row=2, col=1, title_text='Z-Score')
-    fig.update_layout(
-        height=700,
-        hovermode='x unified',
-        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='left', x=0),
-        margin=dict(l=60, r=40, t=80, b=40),
+    # ── 布局：白底、轻网格、无边框感 ─────────────────────────────────
+    axis_common = dict(
+        showgrid=True, gridcolor='rgba(200,200,200,0.4)',
+        zeroline=False, showline=False,
+        tickfont=dict(size=11),
     )
+    fig.update_yaxes(type='log', title_text='点位（对数）', row=1, col=1, **axis_common)
+    fig.update_yaxes(title_text='Z-Score',                 row=2, col=1, **axis_common)
+    fig.update_xaxes(**axis_common)
+    fig.update_layout(
+        height=720,
+        hovermode='x unified',
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(family='PingFang SC, Microsoft YaHei, sans-serif', size=12),
+        legend=dict(
+            orientation='h', yanchor='bottom', y=1.02,
+            xanchor='left', x=0,
+            bgcolor='rgba(255,255,255,0.8)',
+            borderwidth=0,
+        ),
+        margin=dict(l=60, r=80, t=80, b=40),
+        hoverlabel=dict(bgcolor='white', bordercolor='#ccc', font_size=12),
+    )
+    # 子图标题样式
+    for ann in fig.layout.annotations:
+        ann.font.size = 13
+        ann.font.color = '#333333'
 
     st.plotly_chart(fig, use_container_width=True)
 
