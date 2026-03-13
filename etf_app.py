@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import altair as alt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import akshare as ak
 import streamlit as st
 from urllib.parse import urlparse, parse_qs, unquote
@@ -510,47 +511,69 @@ def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0, unadj_fact
 
 
 def render_native_charts(res, etf_name, deviation_pct):
-    """使用 Altair 原生图表渲染，避免 matplotlib 位图在高分屏下模糊。"""
-    plot_df = res['plot_df'].copy()
+    """使用 Plotly 渲染，矢量级清晰度，支持缩放/悬停。"""
+    df = res['plot_df']
+    z_plus  = float(res['z_plus'])
+    z_minus = float(res['z_minus'])
 
-    # 价格图（对数坐标）
-    price_df = plot_df.rename(columns={
-        'Close': '指数',
-        'Trad_Pred_Price': '传统回归',
-        'Roll_Pred_Price': '滚动回归',
-    })
-    price_long = price_df.melt(
-        id_vars='Date',
-        value_vars=['指数', '传统回归', '滚动回归'],
-        var_name='系列',
-        value_name='价格',
+    fig = make_subplots(
+        rows=2, cols=1,
+        row_heights=[0.65, 0.35],
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=[f'{etf_name} 全收益', 'Z-Score 偏离度'],
     )
-    chart_price = alt.Chart(price_long).mark_line().encode(
-        x=alt.X('Date:T', title='日期'),
-        y=alt.Y('价格:Q', title='点位（对数）', scale=alt.Scale(type='log')),
-        color=alt.Color('系列:N', title='系列'),
-        tooltip=[alt.Tooltip('Date:T', title='日期'), '系列:N', alt.Tooltip('价格:Q', format='.4f')],
-    ).properties(height=430, title=f'{etf_name} 全收益（原生图）')
 
-    st.altair_chart(chart_price.interactive(), use_container_width=True)
+    # ── 价格图（对数坐标）────────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=df['Date'], y=df['Close'],
+        name='指数', line=dict(color='black', width=1.5),
+        hovertemplate='%{x|%Y-%m-%d}<br>指数: %{y:,.2f}<extra></extra>',
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=df['Date'], y=df['Trad_Pred_Price'],
+        name='传统回归', line=dict(color='red', width=2, dash='dash'),
+        hovertemplate='%{x|%Y-%m-%d}<br>传统回归: %{y:,.2f}<extra></extra>',
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=df['Date'], y=df['Roll_Pred_Price'],
+        name='滚动回归', line=dict(color='blue', width=1.5, dash='dashdot'),
+        hovertemplate='%{x|%Y-%m-%d}<br>滚动回归: %{y:,.2f}<extra></extra>',
+    ), row=1, col=1)
 
-    # Z-Score 图
-    z_df = plot_df[['Date', 'Trad_Z_Score', 'Roll_Z_Score']].copy()
-    z_df['零轴'] = 0.0
-    z_df['+2σ'] = 2.0
-    z_df['-2σ'] = -2.0
-    z_df[f'+{deviation_pct:.0f}%阈值'] = float(res['z_plus'])
-    z_df[f'-{deviation_pct:.0f}%阈值'] = float(res['z_minus'])
+    # ── Z-Score 图──────────────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=df['Date'], y=df['Trad_Z_Score'],
+        name='传统Z', line=dict(color='black', width=1.5),
+        hovertemplate='%{x|%Y-%m-%d}<br>传统Z: %{y:.3f}<extra></extra>',
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=df['Date'], y=df['Roll_Z_Score'],
+        name='滚动Z', line=dict(color='blue', width=1.2, dash='dot'),
+        hovertemplate='%{x|%Y-%m-%d}<br>滚动Z: %{y:.3f}<extra></extra>',
+    ), row=2, col=1)
 
-    z_long = z_df.melt(id_vars='Date', var_name='系列', value_name='数值')
-    chart_z = alt.Chart(z_long).mark_line().encode(
-        x=alt.X('Date:T', title='日期'),
-        y=alt.Y('数值:Q', title='Z-Score'),
-        color=alt.Color('系列:N', title='系列'),
-        tooltip=[alt.Tooltip('Date:T', title='日期'), '系列:N', alt.Tooltip('数值:Q', format='.4f')],
-    ).properties(height=260, title='Z-Score 偏离度（原生图）')
+    for y_val, color, label in [
+        (0,        'black',  '零轴'),
+        (2,        'red',    '+2σ'),
+        (-2,       'green',  '-2σ'),
+        (z_plus,   'orange', f'+{deviation_pct:.0f}%'),
+        (z_minus,  'orange', f'-{deviation_pct:.0f}%'),
+    ]:
+        fig.add_hline(y=y_val, line=dict(color=color, width=1, dash='dot'),
+                      row=2, col=1, annotation_text=label,
+                      annotation_position='right')
 
-    st.altair_chart(chart_z.interactive(), use_container_width=True)
+    fig.update_yaxes(type='log', row=1, col=1, title_text='点位（对数）')
+    fig.update_yaxes(row=2, col=1, title_text='Z-Score')
+    fig.update_layout(
+        height=700,
+        hovermode='x unified',
+        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='left', x=0),
+        margin=dict(l=60, r=40, t=80, b=40),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # ─── 全市场对比 ───────────────────────────────────────────────────────────────
