@@ -527,7 +527,7 @@ def render_native_charts(res, etf_name, deviation_pct):
     C_TRAD   = '#D97745'   # 暖橙棕 - 传统回归
     C_ROLL   = '#2D8CFF'   # 明亮蓝 - 滚动回归
     C_BAND   = 'rgba(236,182,108,0.16)'  # 暖沙色置信带
-    C_TZERO  = '#7C9A9E'
+    C_TZERO  = '#C8CDD2'
     C_SIGMA  = '#EA9E58'
     C_THRESH = '#DBCB92'
 
@@ -579,7 +579,7 @@ def render_native_charts(res, etf_name, deviation_pct):
     ), row=2, col=1)
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Trad_Z_Score'],
-        name='传统Z', line=dict(color=C_TRAD, width=1.2),
+        name='传统Z', line=dict(color=C_INDEX, width=1.2),
         hovertemplate='%{x|%Y-%m-%d}  传统Z: %{y:.3f}<extra></extra>',
     ), row=2, col=1)
 
@@ -605,7 +605,7 @@ def render_native_charts(res, etf_name, deviation_pct):
         zeroline=False, showline=False,
         tickfont=dict(size=11),
     )
-    fig.update_yaxes(type='log', title_text='点位（对数）', row=1, col=1, **axis_common)
+    fig.update_yaxes(type='linear', title_text='点位', tickformat=',.0f', row=1, col=1, **axis_common)
     fig.update_yaxes(title_text='Z-Score',                 row=2, col=1, **axis_common)
     fig.update_xaxes(**axis_common)
     fig.update_layout(
