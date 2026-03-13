@@ -1051,7 +1051,7 @@ with tab2:
             numeric_cols = ["传统偏离度(%)", "滚动偏离度(%)"]
             styled = compare_df.style.background_gradient(
                 subset=[c for c in numeric_cols if c in compare_df.columns],
-                cmap="RdYlGn_r", vmin=-30, vmax=30,
+                cmap="viridis", vmin=-30, vmax=30,
             ).format({
                 "传统偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
                 "滚动偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
@@ -1063,22 +1063,55 @@ with tab2:
             plot_df = compare_df.dropna(subset=["传统偏离度(%)", "滚动偏离度(%)"])
             if not plot_df.empty:
                 st.subheader("偏离度可视化对比")
-                fig2, ax = plt.subplots(figsize=(12, max(4, len(plot_df) * 0.7)))
-                x = np.arange(len(plot_df))
-                w = 0.35
-                ax.barh(x + w / 2, plot_df["传统偏离度(%)"], w, color='red', alpha=0.7, label='传统偏离度')
-                ax.barh(x - w / 2, plot_df["滚动偏离度(%)"], w, color='blue', alpha=0.7, label='滚动偏离度')
-                ax.axvline(0, color='black', linewidth=1)
-                ax.axvline(deviation_pct, color='orange', linestyle=':', alpha=0.8)
-                ax.axvline(-deviation_pct, color='orange', linestyle=':', alpha=0.8, label=f'±{deviation_pct}%')
-                ax.set_yticks(x)
-                ax.set_yticklabels(plot_df["标的"], fontsize=11)
-                ax.set_xlabel("偏离度 (%)")
-                ax.legend(fontsize=10)
-                ax.grid(True, axis='x', linestyle=':', alpha=0.5)
-                plt.tight_layout()
-                st.pyplot(fig2)
-                plt.close(fig2)
+                plot_df = plot_df.copy()
+                plot_df = plot_df.sort_values("滚动偏离度(%)", ascending=True)
+
+                fig2 = go.Figure()
+                fig2.add_trace(go.Bar(
+                    y=plot_df["标的"],
+                    x=plot_df["传统偏离度(%)"],
+                    name="传统偏离度",
+                    orientation='h',
+                    marker=dict(color="#D97745"),
+                    opacity=0.88,
+                    hovertemplate="标的: %{y}<br>传统偏离度: %{x:+.2f}%<extra></extra>",
+                ))
+                fig2.add_trace(go.Bar(
+                    y=plot_df["标的"],
+                    x=plot_df["滚动偏离度(%)"],
+                    name="滚动偏离度",
+                    orientation='h',
+                    marker=dict(color="#2D8CFF"),
+                    opacity=0.88,
+                    hovertemplate="标的: %{y}<br>滚动偏离度: %{x:+.2f}%<extra></extra>",
+                ))
+
+                fig2.add_vline(x=0, line_color="#666", line_width=1)
+                fig2.add_vline(x=deviation_pct, line_color="#D4A43E", line_dash="dot", line_width=1)
+                fig2.add_vline(x=-deviation_pct, line_color="#D4A43E", line_dash="dot", line_width=1)
+
+                fig2.update_layout(
+                    barmode="group",
+                    bargap=0.22,
+                    height=max(360, 52 * len(plot_df)),
+                    template="plotly_white",
+                    margin=dict(l=20, r=20, t=10, b=20),
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=1.02,
+                        xanchor="right",
+                        x=1,
+                    ),
+                    xaxis=dict(
+                        title="偏离度 (%)",
+                        zeroline=False,
+                        gridcolor="rgba(200,200,200,0.35)",
+                    ),
+                    yaxis=dict(title=""),
+                )
+
+                st.plotly_chart(fig2, use_container_width=True)
 
 with tab3:
     st.subheader("📤 数据管理")
