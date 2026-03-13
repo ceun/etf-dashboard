@@ -1051,7 +1051,7 @@ with tab2:
             numeric_cols = ["传统偏离度(%)", "滚动偏离度(%)"]
             styled = compare_df.style.background_gradient(
                 subset=[c for c in numeric_cols if c in compare_df.columns],
-                cmap="viridis", vmin=-30, vmax=30,
+                cmap="coolwarm", vmin=-30, vmax=30,
             ).format({
                 "传统偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
                 "滚动偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
@@ -1072,7 +1072,7 @@ with tab2:
                     x=plot_df["传统偏离度(%)"],
                     name="传统偏离度",
                     orientation='h',
-                    marker=dict(color="#D97745"),
+                    marker=dict(color="#BFDFD2"),
                     opacity=0.88,
                     hovertemplate="标的: %{y}<br>传统偏离度: %{x:+.2f}%<extra></extra>",
                 ))
@@ -1081,7 +1081,7 @@ with tab2:
                     x=plot_df["滚动偏离度(%)"],
                     name="滚动偏离度",
                     orientation='h',
-                    marker=dict(color="#2D8CFF"),
+                    marker=dict(color="#7BC0CD"),
                     opacity=0.88,
                     hovertemplate="标的: %{y}<br>滚动偏离度: %{x:+.2f}%<extra></extra>",
                 ))
