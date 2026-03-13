@@ -6,3 +6,5 @@ streamlit>=1.40
 psycopg2-binary
 openpyxl
 xlrd
+plotly
+baostock
