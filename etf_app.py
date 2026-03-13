@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import altair as alt
 import akshare as ak
 import streamlit as st
 from urllib.parse import urlparse, parse_qs, unquote
@@ -499,7 +500,57 @@ def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0, unadj_fact
         "cagr_roll":    (np.exp(k_roll_last * 252) - 1) * 100,
         "scaling_factor": scaling_factor,
         "unadj_factor": unadj_factor,
+        "z_plus": z_plus,
+        "z_minus": z_minus,
+        "plot_df": df[[
+            'Date', 'Close', 'Trad_Pred_Price', 'Roll_Pred_Price',
+            'Trad_Z_Score', 'Roll_Z_Score'
+        ]].copy(),
     }
+
+
+def render_native_charts(res, etf_name, deviation_pct):
+    """使用 Altair 原生图表渲染，避免 matplotlib 位图在高分屏下模糊。"""
+    plot_df = res['plot_df'].copy()
+
+    # 价格图（对数坐标）
+    price_df = plot_df.rename(columns={
+        'Close': '指数',
+        'Trad_Pred_Price': '传统回归',
+        'Roll_Pred_Price': '滚动回归',
+    })
+    price_long = price_df.melt(
+        id_vars='Date',
+        value_vars=['指数', '传统回归', '滚动回归'],
+        var_name='系列',
+        value_name='价格',
+    )
+    chart_price = alt.Chart(price_long).mark_line().encode(
+        x=alt.X('Date:T', title='日期'),
+        y=alt.Y('价格:Q', title='点位（对数）', scale=alt.Scale(type='log')),
+        color=alt.Color('系列:N', title='系列'),
+        tooltip=[alt.Tooltip('Date:T', title='日期'), '系列:N', alt.Tooltip('价格:Q', format='.4f')],
+    ).properties(height=430, title=f'{etf_name} 全收益（原生图）')
+
+    st.altair_chart(chart_price.interactive(), use_container_width=True)
+
+    # Z-Score 图
+    z_df = plot_df[['Date', 'Trad_Z_Score', 'Roll_Z_Score']].copy()
+    z_df['零轴'] = 0.0
+    z_df['+2σ'] = 2.0
+    z_df['-2σ'] = -2.0
+    z_df[f'+{deviation_pct:.0f}%阈值'] = float(res['z_plus'])
+    z_df[f'-{deviation_pct:.0f}%阈值'] = float(res['z_minus'])
+
+    z_long = z_df.melt(id_vars='Date', var_name='系列', value_name='数值')
+    chart_z = alt.Chart(z_long).mark_line().encode(
+        x=alt.X('Date:T', title='日期'),
+        y=alt.Y('数值:Q', title='Z-Score'),
+        color=alt.Color('系列:N', title='系列'),
+        tooltip=[alt.Tooltip('Date:T', title='日期'), '系列:N', alt.Tooltip('数值:Q', format='.4f')],
+    ).properties(height=260, title='Z-Score 偏离度（原生图）')
+
+    st.altair_chart(chart_z.interactive(), use_container_width=True)
 
 
 # ─── 全市场对比 ───────────────────────────────────────────────────────────────
@@ -757,7 +808,7 @@ with tab1:
             try:
                 unadj_factor, factor_source = get_unadj_factor_from_baostock(etf_code)
                 fig, res = compute_and_plot(df, etf_name, deviation_pct, scaling_factor, unadj_factor)
-                st.pyplot(fig)
+                render_native_charts(res, etf_name, deviation_pct)
                 plt.close(fig)
 
                 if factor_source != "baostock":
