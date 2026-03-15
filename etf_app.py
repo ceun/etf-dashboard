@@ -1003,7 +1003,7 @@ with st.sidebar:
             value=DEFAULT_TRADITION_START,
             min_value=DEFAULT_TRADITION_START,
             max_value=today,
-            format="YYYYMMDD",
+            format="YYYY/MM/DD",
             key="tradition_start_date",
         )
         tradition_end = st.date_input(
@@ -1011,7 +1011,7 @@ with st.sidebar:
             value=today,
             min_value=DEFAULT_TRADITION_START,
             max_value=today,
-            format="YYYYMMDD",
+            format="YYYY/MM/DD",
             key="tradition_end_date",
         )
         st.caption("旧固定区间参考：20081031-20221031")
