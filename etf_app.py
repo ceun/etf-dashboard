@@ -997,7 +997,7 @@ with st.sidebar:
         selected = st.selectbox("选择标的", list(ACTIVE_ETF_CONFIG.keys()))
         deviation_pct = st.slider("偏离阈值 (%)", 5, 30, 15, 1)
         ma_window = st.number_input("MA周期", min_value=20, max_value=1000, value=250, step=5)
-        rolling_window = st.number_input("滚动回归周期", min_value=250, max_value=3000, value=DEFAULT_ROLLING_WINDOW, step=10)
+        rolling_window = st.number_input("滚动回归周期", min_value=1, value=DEFAULT_ROLLING_WINDOW, step=1)
         today = pd.Timestamp.today().date()
         tradition_start = st.date_input(
             "传统回归起始日期",
