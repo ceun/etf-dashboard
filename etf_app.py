@@ -470,11 +470,10 @@ def _incremental_akshare_update(etf_code, scaling_factor):
     save_prices_to_db(new_data[['Date', 'index_close', 'etf_close', 'combined_close']], etf_code)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_data(etf_code: str):
+def sync_data_from_akshare(etf_code: str):
     """
-    DB 优先 → 检查拼接状态 → (完整拼接 或 增量更新) → 返回 (df[Date, Close], scaling_factor)
-    若 DB 无数据，全量拉 AkShare（scaling_factor=1.0，需后续上传指数文件重新拼接）。
+    仅在手动点击「更新全部数据」时调用：
+    DB 有数据则执行完整拼接检查/增量更新；DB 无数据则全量初始化。
     """
     df, scaling_factor = load_from_db(etf_code)
     if df is None:
@@ -488,18 +487,23 @@ def get_data(etf_code: str):
             'combined_close': raw['ETF_Close'],
         })
         save_prices_to_db(rows, etf_code)
-        df = raw[['Date']].copy()
-        df['Close'] = raw['ETF_Close'].values
-        scaling_factor = 1.0
     else:
         # 检查是否需要完整拼接（历史数据未初始化 etf_close）
         if _check_needs_full_stitch(etf_code):
             _full_stitch_from_db(etf_code)
-            df, scaling_factor = load_from_db(etf_code)
         else:
             _incremental_akshare_update(etf_code, scaling_factor)
-            df, scaling_factor = load_from_db(etf_code)
-    return df, scaling_factor
+
+    return load_from_db(etf_code)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_data(etf_code: str):
+    """
+    页面加载只读数据库，不触发任何 AkShare 网络请求。
+    实时更新请点击侧边栏「更新全部数据」。
+    """
+    return load_from_db(etf_code)
 
 
 # ─── 核心分析 ─────────────────────────────────────────────────────────────────
@@ -956,7 +960,7 @@ with st.sidebar:
         for idx, (name, cfg) in enumerate(etf_list):
             with st.spinner(f"拉取 {name}..."):
                 try:
-                    get_data(cfg['etf_code'])
+                    sync_data_from_akshare(cfg['etf_code'])
                 except Exception as e:
                     st.warning(f"{name} 失败: {e}")
             prog.progress((idx + 1) / len(etf_list))
