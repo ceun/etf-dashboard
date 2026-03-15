@@ -997,27 +997,27 @@ with st.sidebar:
     else:
         selected = st.selectbox("选择标的", list(ACTIVE_ETF_CONFIG.keys()))
         deviation_pct = st.slider("偏离阈值 (%)", 5, 30, 15, 1)
-
-        with st.expander("传统回归区间（可调）", expanded=False):
-            today = pd.Timestamp.today().date()
-            tradition_start = st.date_input(
-                "起始日期",
-                value=DEFAULT_TRADITION_START,
-                min_value=DEFAULT_TRADITION_START,
-                max_value=today,
-                key="tradition_start_date",
-            )
-            tradition_end = st.date_input(
-                "结束日期",
-                value=today,
-                min_value=DEFAULT_TRADITION_START,
-                max_value=today,
-                key="tradition_end_date",
-            )
-            st.caption("旧固定区间参考：20081031-20221031")
-            if tradition_start > tradition_end:
-                st.warning("起始日期不能晚于结束日期，已自动调整为结束日期。")
-                tradition_start = tradition_end
+        today = pd.Timestamp.today().date()
+        tradition_start = st.date_input(
+            "传统回归起始日期",
+            value=DEFAULT_TRADITION_START,
+            min_value=DEFAULT_TRADITION_START,
+            max_value=today,
+            format="YYYYMMDD",
+            key="tradition_start_date",
+        )
+        tradition_end = st.date_input(
+            "传统回归结束日期",
+            value=today,
+            min_value=DEFAULT_TRADITION_START,
+            max_value=today,
+            format="YYYYMMDD",
+            key="tradition_end_date",
+        )
+        st.caption("旧固定区间参考：20081031-20221031")
+        if tradition_start > tradition_end:
+            st.warning("起始日期不能晚于结束日期，已自动调整为结束日期。")
+            tradition_start = tradition_end
 
     st.divider()
     if st.button("🔄 更新全部数据", use_container_width=True, type="primary"):
