@@ -25,7 +25,7 @@ st.set_page_config(page_title="今天买什么", page_icon="📈", layout="wide"
 
 # ─── 全局配置 ────────────────────────────────────────────────────────────────
 DEFAULT_TRADITION_START = pd.to_datetime("20081031", format="%Y%m%d").date()
-ROLLING_WINDOW  = 1250
+DEFAULT_ROLLING_WINDOW = 1250
 # Supabase 连接字符串（从 Streamlit secrets 读取）
 DATABASE_URL_POOLER = st.secrets.get("database_url_pooler", None)
 DATABASE_URL_DIRECT = st.secrets.get("database_url", None)
@@ -506,7 +506,7 @@ def get_data(etf_code: str):
 
 
 # ─── 核心分析 ─────────────────────────────────────────────────────────────────
-def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, ma_window=250, scaling_factor=1.0, unadj_factor=1.0):
+def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window=1250, ma_window=250, scaling_factor=1.0, unadj_factor=1.0):
     df = df.copy()
     df['Log_Close'] = np.log(df['Close'])
     df['Time_Idx']  = np.arange(len(df))
@@ -532,11 +532,11 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     rolling_preds = np.full(len(df), np.nan)
     rolling_z     = np.full(len(df), np.nan)
     k_roll_last   = np.nan
-    for i in range(ROLLING_WINDOW, len(df)):
-        ys = df['Log_Close'].values[i - ROLLING_WINDOW:i]
-        xs = np.arange(ROLLING_WINDOW)
+    for i in range(rolling_window, len(df)):
+        ys = df['Log_Close'].values[i - rolling_window:i]
+        xs = np.arange(rolling_window)
         k_r, b_r = np.polyfit(xs, ys, 1)
-        pred = k_r * (ROLLING_WINDOW - 1) + b_r
+        pred = k_r * (rolling_window - 1) + b_r
         rolling_preds[i] = pred
         std_r = np.std(ys - (k_r * xs + b_r))
         if std_r > 0:
@@ -569,7 +569,7 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
                      np.exp(df['Trad_Pred_Log'] + 2 * std_trad),
                      color='red', alpha=0.1, label='传统通道(±2σ)')
     ax1.plot(df['Date'], df['Roll_Pred_Price'], color='blue', linestyle='-.',
-             linewidth=1.5, label=f'滚动回归({ROLLING_WINDOW}日)')
+             linewidth=1.5, label=f'滚动回归({rolling_window}日)')
     ax1.plot(df['Date'], df['MA_Price'], color='#2F9E44', linestyle='-',
              linewidth=1.5, label=f'年均线(MA{ma_window})')
     ax1.set_yscale('log')
@@ -649,7 +649,7 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     }
 
 
-def render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, ma_window=250):
+def render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window=1250, ma_window=250):
     """使用 Plotly 渲染，现代简洁风格，含置信带、对数坐标、悬停。"""
     df       = res['plot_df'].copy()
     z_plus   = float(res['z_plus'])
@@ -700,7 +700,7 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
     # ── 滚动回归线（点划线）──────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Roll_Pred_Price'],
-        name=f'滚动回归 ({ROLLING_WINDOW}日)',
+        name=f'滚动回归 ({rolling_window}日)',
         line=dict(color=C_ROLL, width=1.35, dash='dashdot'),
         hovertemplate='%{x|%Y-%m-%d}  滚动: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
@@ -799,7 +799,7 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
 
 
 # ─── 全市场对比 ───────────────────────────────────────────────────────────────
-def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, ma_window=250):
+def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, rolling_window=1250, ma_window=250):
     ma_dev_col = f"MA{ma_window}偏离度(%)"
     rows = []
     for name, cfg in etf_config.items():
@@ -811,14 +811,14 @@ def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, 
                          "传统偏离度(%)": None, "滚动偏离度(%)": None, ma_dev_col: None,
                          "传统CAGR(%)": None, "滚动CAGR(%)": None})
             continue
-        if df is None or len(df) < ROLLING_WINDOW + 10:
+        if df is None or len(df) < rolling_window + 10:
             rows.append({"标的": name, "ETF代码": cfg['etf_code'],
                          "最新日期": "无数据（请先拼接入库）",
                          "传统偏离度(%)": None, "滚动偏离度(%)": None, ma_dev_col: None,
                          "传统CAGR(%)": None, "滚动CAGR(%)": None})
             continue
         try:
-            fig, res = compute_and_plot(df, name, deviation_pct, tradition_start, tradition_end, ma_window, scaling_factor)
+            fig, res = compute_and_plot(df, name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor)
             plt.close(fig)
             rows.append({
                 "标的": name, "ETF代码": cfg['etf_code'],
@@ -982,6 +982,7 @@ st.session_state["etf_config_runtime"] = load_targets_from_db()
 ACTIVE_ETF_CONFIG = st.session_state["etf_config_runtime"]
 deviation_pct = 15
 ma_window = 250
+rolling_window = DEFAULT_ROLLING_WINDOW
 selected = None
 tradition_start = DEFAULT_TRADITION_START
 tradition_end = pd.Timestamp.today().date()
@@ -996,6 +997,7 @@ with st.sidebar:
         selected = st.selectbox("选择标的", list(ACTIVE_ETF_CONFIG.keys()))
         deviation_pct = st.slider("偏离阈值 (%)", 5, 30, 15, 1)
         ma_window = st.number_input("MA周期", min_value=20, max_value=1000, value=250, step=5)
+        rolling_window = st.number_input("滚动回归周期", min_value=250, max_value=3000, value=DEFAULT_ROLLING_WINDOW, step=10)
         today = pd.Timestamp.today().date()
         tradition_start = st.date_input(
             "传统回归起始日期",
@@ -1070,13 +1072,13 @@ with tab1:
                 st.error(f"❌ 数据加载失败：{e}")
                 st.stop()
 
-        if df is None or len(df) < ROLLING_WINDOW + 10:
+        if df is None or len(df) < rolling_window + 10:
             st.error("数据不足，无法计算回归，请先在「数据管理」中上传历史指数文件并拼接。")
         else:
             try:
                 unadj_factor, factor_source = get_unadj_factor_from_baostock(etf_code)
-                fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, ma_window, scaling_factor, unadj_factor)
-                render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, ma_window)
+                fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor, unadj_factor)
+                render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window)
                 plt.close(fig)
 
                 if factor_source != "baostock":
@@ -1120,7 +1122,7 @@ with tab2:
         st.caption("对比数据来自数据库，更新请点击侧边栏「更新全部数据」")
         ma_dev_col = f"MA{ma_window}偏离度(%)"
         with st.spinner("计算全市场偏离度..."):
-            compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG, tradition_start, tradition_end, ma_window)
+            compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG, tradition_start, tradition_end, rolling_window, ma_window)
 
         if compare_df.empty:
             st.info("无数据，请先拼接入库。")
