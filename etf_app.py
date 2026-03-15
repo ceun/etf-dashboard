@@ -506,7 +506,7 @@ def get_data(etf_code: str):
 
 
 # ─── 核心分析 ─────────────────────────────────────────────────────────────────
-def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, scaling_factor=1.0, unadj_factor=1.0):
+def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, ma_window=250, scaling_factor=1.0, unadj_factor=1.0):
     df = df.copy()
     df['Log_Close'] = np.log(df['Close'])
     df['Time_Idx']  = np.arange(len(df))
@@ -545,18 +545,18 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     df['Roll_Pred_Price'] = np.exp(rolling_preds)
     df['Roll_Z_Score']    = rolling_z
 
-    # MA250 年均线
-    df['MA250_Price'] = df['Close'].rolling(window=250, min_periods=250).mean()
+    # MA 年均线（可调窗口）
+    df['MA_Price'] = df['Close'].rolling(window=ma_window, min_periods=ma_window).mean()
     ma_log_diff = np.full(len(df), np.nan)
-    ma_mask = df['MA250_Price'].notna() & (df['MA250_Price'] > 0)
+    ma_mask = df['MA_Price'].notna() & (df['MA_Price'] > 0)
     ma_log_diff[ma_mask.values] = (
-        df.loc[ma_mask, 'Log_Close'].values - np.log(df.loc[ma_mask, 'MA250_Price'].values)
+        df.loc[ma_mask, 'Log_Close'].values - np.log(df.loc[ma_mask, 'MA_Price'].values)
     )
-    std_ma250 = np.nanstd(ma_log_diff)
-    if pd.notna(std_ma250) and std_ma250 > 0:
-        df['MA250_Z_Score'] = ma_log_diff / std_ma250
+    std_ma = np.nanstd(ma_log_diff)
+    if pd.notna(std_ma) and std_ma > 0:
+        df['MA_Z_Score'] = ma_log_diff / std_ma
     else:
-        df['MA250_Z_Score'] = np.nan
+        df['MA_Z_Score'] = np.nan
 
     # 绘图
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
@@ -570,8 +570,8 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
                      color='red', alpha=0.1, label='传统通道(±2σ)')
     ax1.plot(df['Date'], df['Roll_Pred_Price'], color='blue', linestyle='-.',
              linewidth=1.5, label=f'滚动回归({ROLLING_WINDOW}日)')
-    ax1.plot(df['Date'], df['MA250_Price'], color='#2F9E44', linestyle='-',
-             linewidth=1.5, label='年均线(MA250)')
+    ax1.plot(df['Date'], df['MA_Price'], color='#2F9E44', linestyle='-',
+             linewidth=1.5, label=f'年均线(MA{ma_window})')
     ax1.set_yscale('log')
     ax1.set_title(f'{etf_name} 全收益', fontsize=15, fontweight='bold')
     ax1.set_ylabel('点位（对数）', fontsize=11)
@@ -589,8 +589,8 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
              alpha=0.8, linewidth=1.2, label='滚动Z', zorder=2)
     ax2.plot(df['Date'], df['Trad_Z_Score'], color='black',
              alpha=0.95, linewidth=1.5, label='传统Z', zorder=3)
-    ax2.plot(df['Date'], df['MA250_Z_Score'], color='#2F9E44', linestyle='-',
-             alpha=0.9, linewidth=1.2, label='MA250-Z', zorder=2)
+    ax2.plot(df['Date'], df['MA_Z_Score'], color='#2F9E44', linestyle='-',
+             alpha=0.9, linewidth=1.2, label=f'MA{ma_window}-Z', zorder=2)
     ax2.set_title('Z-Score 偏离度', fontsize=13)
     ax2.set_ylabel('Z-Score', fontsize=11)
     ax2.legend(loc='upper left', fontsize=9)
@@ -609,12 +609,12 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     latest_close = float(df['Close'].iloc[-1])
     trad_pred    = float(df['Trad_Pred_Price'].iloc[-1])
     roll_pred    = float(df['Roll_Pred_Price'].iloc[-1])
-    ma250_pred   = float(df['MA250_Price'].iloc[-1]) if pd.notna(df['MA250_Price'].iloc[-1]) else np.nan
+    ma_pred   = float(df['MA_Price'].iloc[-1]) if pd.notna(df['MA_Price'].iloc[-1]) else np.nan
 
-    if pd.notna(ma250_pred) and ma250_pred > 0:
-        dev_ma250 = (latest_close / ma250_pred - 1) * 100
+    if pd.notna(ma_pred) and ma_pred > 0:
+        dev_ma = (latest_close / ma_pred - 1) * 100
     else:
-        dev_ma250 = np.nan
+        dev_ma = np.nan
 
     # 展示口径：指数点位 -> 后复权ETF -> 不复权ETF
     def to_unadj_etf(point_value):
@@ -630,11 +630,11 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
         "trad_pred_etf": to_unadj_etf(trad_pred),
         "roll_pred":    roll_pred,
         "roll_pred_etf": to_unadj_etf(roll_pred),
-        "ma250_pred":   ma250_pred,
-        "ma250_pred_etf": to_unadj_etf(ma250_pred) if pd.notna(ma250_pred) else np.nan,
+        "ma_pred":   ma_pred,
+        "ma_pred_etf": to_unadj_etf(ma_pred) if pd.notna(ma_pred) else np.nan,
         "dev_trad":     (latest_close / trad_pred - 1) * 100,
         "dev_roll":     (latest_close / roll_pred - 1) * 100,
-        "dev_ma250":    dev_ma250,
+        "dev_ma":       dev_ma,
         "cagr_trad":    (np.exp(k_trad * 252) - 1) * 100,
         "cagr_roll":    (np.exp(k_roll_last * 252) - 1) * 100,
         "scaling_factor": scaling_factor,
@@ -643,13 +643,13 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
         "z_minus": z_minus,
         "std_trad": std_trad,
         "plot_df": df[[
-            'Date', 'Close', 'Trad_Pred_Price', 'Roll_Pred_Price', 'MA250_Price',
-            'Trad_Z_Score', 'Roll_Z_Score', 'MA250_Z_Score', 'Trad_Pred_Log',
+            'Date', 'Close', 'Trad_Pred_Price', 'Roll_Pred_Price', 'MA_Price',
+            'Trad_Z_Score', 'Roll_Z_Score', 'MA_Z_Score', 'Trad_Pred_Log',
         ]].copy(),
     }
 
 
-def render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end):
+def render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, ma_window=250):
     """使用 Plotly 渲染，现代简洁风格，含置信带、对数坐标、悬停。"""
     df       = res['plot_df'].copy()
     z_plus   = float(res['z_plus'])
@@ -666,7 +666,7 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
     C_INDEX  = '#51999F'   # 海蓝绿 - 指数主线
     C_TRAD   = '#D97745'   # 暖橙棕 - 传统回归
     C_ROLL   = '#2D8CFF'   # 明亮蓝 - 滚动回归
-    C_MA250  = '#2F9E44'   # 绿色 - MA250
+    C_MA  = '#2F9E44'   # 绿色 - MA
     C_BAND   = 'rgba(236,182,108,0.16)'  # 暖沙色置信带
     C_TZERO  = '#C8CDD2'
     C_SIGMA  = '#EA9E58'
@@ -705,12 +705,12 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
         hovertemplate='%{x|%Y-%m-%d}  滚动: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
 
-    # ── MA250 年均线 ───────────────────────────────────────────────
+    # ── MA 年均线 ───────────────────────────────────────────────
     fig.add_trace(go.Scatter(
-        x=df['Date'], y=df['MA250_Price'],
-        name='年均线 (MA250)',
-        line=dict(color=C_MA250, width=1.35, dash='solid'),
-        hovertemplate='%{x|%Y-%m-%d}  MA250: %{y:,.1f}<extra></extra>',
+        x=df['Date'], y=df['MA_Price'],
+        name=f'年均线 (MA{ma_window})',
+        line=dict(color=C_MA, width=1.35, dash='solid'),
+        hovertemplate='%{x|%Y-%m-%d}  MA: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
 
     # ── 指数主线（最顶层）────────────────────────────────────────────
@@ -732,9 +732,9 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
         hovertemplate='%{x|%Y-%m-%d}  传统Z: %{y:.3f}<extra></extra>',
     ), row=2, col=1)
     fig.add_trace(go.Scatter(
-        x=df['Date'], y=df['MA250_Z_Score'],
-        name='MA250-Z', line=dict(color=C_MA250, width=1.2),
-        hovertemplate='%{x|%Y-%m-%d}  MA250-Z: %{y:.3f}<extra></extra>',
+        x=df['Date'], y=df['MA_Z_Score'],
+        name=f'MA{ma_window}-Z', line=dict(color=C_MA, width=1.2),
+        hovertemplate='%{x|%Y-%m-%d}  MA-Z: %{y:.3f}<extra></extra>',
     ), row=2, col=1)
 
     # ── Z-Score 水平参考线 ────────────────────────────────────────
@@ -799,7 +799,8 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
 
 
 # ─── 全市场对比 ───────────────────────────────────────────────────────────────
-def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end):
+def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, ma_window=250):
+    ma_dev_col = f"MA{ma_window}偏离度(%)"
     rows = []
     for name, cfg in etf_config.items():
         try:
@@ -807,31 +808,31 @@ def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end):
         except Exception as e:
             rows.append({"标的": name, "ETF代码": cfg['etf_code'],
                          "最新日期": f"加载失败: {e}",
-                         "传统偏离度(%)": None, "滚动偏离度(%)": None, "MA250偏离度(%)": None,
+                         "传统偏离度(%)": None, "滚动偏离度(%)": None, ma_dev_col: None,
                          "传统CAGR(%)": None, "滚动CAGR(%)": None})
             continue
         if df is None or len(df) < ROLLING_WINDOW + 10:
             rows.append({"标的": name, "ETF代码": cfg['etf_code'],
                          "最新日期": "无数据（请先拼接入库）",
-                         "传统偏离度(%)": None, "滚动偏离度(%)": None, "MA250偏离度(%)": None,
+                         "传统偏离度(%)": None, "滚动偏离度(%)": None, ma_dev_col: None,
                          "传统CAGR(%)": None, "滚动CAGR(%)": None})
             continue
         try:
-            fig, res = compute_and_plot(df, name, deviation_pct, tradition_start, tradition_end, scaling_factor)
+            fig, res = compute_and_plot(df, name, deviation_pct, tradition_start, tradition_end, ma_window, scaling_factor)
             plt.close(fig)
             rows.append({
                 "标的": name, "ETF代码": cfg['etf_code'],
                 "最新日期":    res['latest_date'],
                 "传统偏离度(%)": round(res['dev_trad'], 2),
                 "滚动偏离度(%)": round(res['dev_roll'], 2),
-                "MA250偏离度(%)": round(res['dev_ma250'], 2) if pd.notna(res['dev_ma250']) else None,
+                ma_dev_col: round(res['dev_ma'], 2) if pd.notna(res['dev_ma']) else None,
                 "传统CAGR(%)":   round(res['cagr_trad'], 2),
                 "滚动CAGR(%)":   round(res['cagr_roll'], 2),
             })
         except Exception as e:
             rows.append({"标的": name, "ETF代码": cfg['etf_code'],
                          "最新日期": f"出错: {e}",
-                         "传统偏离度(%)": None, "滚动偏离度(%)": None, "MA250偏离度(%)": None,
+                         "传统偏离度(%)": None, "滚动偏离度(%)": None, ma_dev_col: None,
                          "传统CAGR(%)": None, "滚动CAGR(%)": None})
     return pd.DataFrame(rows)
 
@@ -975,21 +976,18 @@ def stitch_with_akshare(history_df, etf_code):
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
 st.title("📈 今天买什么")
 
-if "etf_config_runtime" not in st.session_state:
-    st.session_state["etf_config_runtime"] = load_targets_from_db()
+# 每次页面 rerun 都从数据库同步标的列表
+st.session_state["etf_config_runtime"] = load_targets_from_db()
 
 ACTIVE_ETF_CONFIG = st.session_state["etf_config_runtime"]
 deviation_pct = 15
+ma_window = 250
 selected = None
 tradition_start = DEFAULT_TRADITION_START
 tradition_end = pd.Timestamp.today().date()
 
 with st.sidebar:
     st.header("⚙️ 参数设置")
-    if st.button("🔄 从数据库同步标的", use_container_width=True):
-        st.session_state["etf_config_runtime"] = load_targets_from_db()
-        st.rerun()
-
     ACTIVE_ETF_CONFIG = st.session_state["etf_config_runtime"]
 
     if not ACTIVE_ETF_CONFIG:
@@ -997,6 +995,7 @@ with st.sidebar:
     else:
         selected = st.selectbox("选择标的", list(ACTIVE_ETF_CONFIG.keys()))
         deviation_pct = st.slider("偏离阈值 (%)", 5, 30, 15, 1)
+        ma_window = st.number_input("MA周期", min_value=20, max_value=1000, value=250, step=5)
         today = pd.Timestamp.today().date()
         tradition_start = st.date_input(
             "传统回归起始日期",
@@ -1076,8 +1075,8 @@ with tab1:
         else:
             try:
                 unadj_factor, factor_source = get_unadj_factor_from_baostock(etf_code)
-                fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, scaling_factor, unadj_factor)
-                render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end)
+                fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, ma_window, scaling_factor, unadj_factor)
+                render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, ma_window)
                 plt.close(fig)
 
                 if factor_source != "baostock":
@@ -1106,11 +1105,11 @@ with tab1:
                 c10.metric("偏离度", f"{res['dev_roll']:+.2f}%", delta_color="inverse")
                 c11.metric("年化", f"{res['cagr_roll']:.2f}%")
 
-                st.subheader("年均线 MA250")
+                st.subheader(f"年均线 MA{ma_window}")
                 c12, c13, c14 = st.columns(3)
-                c12.metric("指数点位", f"{res['ma250_pred']:,.0f}" if pd.notna(res['ma250_pred']) else "—")
-                c13.metric("预估价格", f"{res['ma250_pred_etf']:.4f}" if pd.notna(res['ma250_pred_etf']) else "—")
-                c14.metric("偏离度", f"{res['dev_ma250']:+.2f}%" if pd.notna(res['dev_ma250']) else "—", delta_color="inverse")
+                c12.metric("指数点位", f"{res['ma_pred']:,.0f}" if pd.notna(res['ma_pred']) else "—")
+                c13.metric("预估价格", f"{res['ma_pred_etf']:.4f}" if pd.notna(res['ma_pred_etf']) else "—")
+                c14.metric("偏离度", f"{res['dev_ma']:+.2f}%" if pd.notna(res['dev_ma']) else "—", delta_color="inverse")
             except Exception as e:
                 st.error(f"计算出错：{e}")
 
@@ -1119,27 +1118,27 @@ with tab2:
         st.info("暂无标的数据。")
     else:
         st.caption("对比数据来自数据库，更新请点击侧边栏「更新全部数据」")
+        ma_dev_col = f"MA{ma_window}偏离度(%)"
         with st.spinner("计算全市场偏离度..."):
-            compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG, tradition_start, tradition_end)
+            compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG, tradition_start, tradition_end, ma_window)
 
         if compare_df.empty:
             st.info("无数据，请先拼接入库。")
         else:
-            numeric_cols = ["传统偏离度(%)", "滚动偏离度(%)", "MA250偏离度(%)"]
+            numeric_cols = ["传统偏离度(%)", "滚动偏离度(%)", ma_dev_col]
             styled = compare_df.style.background_gradient(
                 subset=[c for c in numeric_cols if c in compare_df.columns],
                 cmap="coolwarm", vmin=-100, vmax=100,
             ).format({
                 "传统偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
                 "滚动偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
-                "MA250偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
+                ma_dev_col: lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
                 "传统CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
                 "滚动CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
-                "MA250年化(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
             })
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
-            plot_df = compare_df.dropna(subset=["传统偏离度(%)", "滚动偏离度(%)", "MA250偏离度(%)"])
+            plot_df = compare_df.dropna(subset=["传统偏离度(%)", "滚动偏离度(%)", ma_dev_col])
             if not plot_df.empty:
                 st.subheader("偏离度对比")
                 plot_df = plot_df.copy()
@@ -1166,12 +1165,12 @@ with tab2:
                 ))
                 fig2.add_trace(go.Bar(
                     y=plot_df["标的"],
-                    x=plot_df["MA250偏离度(%)"],
-                    name="MA250偏离度",
+                    x=plot_df[ma_dev_col],
+                    name=f"MA{ma_window}偏离度",
                     orientation='h',
                     marker=dict(color="#2F9E44"),
                     opacity=0.88,
-                    hovertemplate="标的: %{y}<br>MA250偏离度: %{x:+.2f}%<extra></extra>",
+                    hovertemplate="标的: %{y}<br>MA偏离度: %{x:+.2f}%<extra></extra>",
                 ))
 
                 fig2.add_vline(x=0, line_color="#666", line_width=1)
