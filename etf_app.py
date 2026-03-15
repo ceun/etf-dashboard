@@ -615,12 +615,6 @@ def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0, unadj_fact
     else:
         dev_ma250 = np.nan
 
-    ma250_prev = df['MA250_Price'].shift(250).iloc[-1] if len(df) > 250 else np.nan
-    if pd.notna(ma250_pred) and pd.notna(ma250_prev) and ma250_prev > 0:
-        cagr_ma250 = ((ma250_pred / ma250_prev) ** (252 / 250) - 1) * 100
-    else:
-        cagr_ma250 = np.nan
-
     # 展示口径：指数点位 -> 后复权ETF -> 不复权ETF
     def to_unadj_etf(point_value):
         if scaling_factor > 0:
@@ -642,7 +636,6 @@ def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0, unadj_fact
         "dev_ma250":    dev_ma250,
         "cagr_trad":    (np.exp(k_trad * 252) - 1) * 100,
         "cagr_roll":    (np.exp(k_roll_last * 252) - 1) * 100,
-        "cagr_ma250":   cagr_ma250,
         "scaling_factor": scaling_factor,
         "unadj_factor": unadj_factor,
         "z_plus": z_plus,
@@ -812,13 +805,13 @@ def build_comparison(deviation_pct, etf_config):
             rows.append({"标的": name, "ETF代码": cfg['etf_code'],
                          "最新日期": f"加载失败: {e}",
                          "传统偏离度(%)": None, "滚动偏离度(%)": None, "MA250偏离度(%)": None,
-                         "传统CAGR(%)": None, "滚动CAGR(%)": None, "MA250年化(%)": None})
+                         "传统CAGR(%)": None, "滚动CAGR(%)": None})
             continue
         if df is None or len(df) < ROLLING_WINDOW + 10:
             rows.append({"标的": name, "ETF代码": cfg['etf_code'],
                          "最新日期": "无数据（请先拼接入库）",
                          "传统偏离度(%)": None, "滚动偏离度(%)": None, "MA250偏离度(%)": None,
-                         "传统CAGR(%)": None, "滚动CAGR(%)": None, "MA250年化(%)": None})
+                         "传统CAGR(%)": None, "滚动CAGR(%)": None})
             continue
         try:
             fig, res = compute_and_plot(df, name, deviation_pct, scaling_factor)
@@ -831,13 +824,12 @@ def build_comparison(deviation_pct, etf_config):
                 "MA250偏离度(%)": round(res['dev_ma250'], 2) if pd.notna(res['dev_ma250']) else None,
                 "传统CAGR(%)":   round(res['cagr_trad'], 2),
                 "滚动CAGR(%)":   round(res['cagr_roll'], 2),
-                "MA250年化(%)":   round(res['cagr_ma250'], 2) if pd.notna(res['cagr_ma250']) else None,
             })
         except Exception as e:
             rows.append({"标的": name, "ETF代码": cfg['etf_code'],
                          "最新日期": f"出错: {e}",
                          "传统偏离度(%)": None, "滚动偏离度(%)": None, "MA250偏离度(%)": None,
-                         "传统CAGR(%)": None, "滚动CAGR(%)": None, "MA250年化(%)": None})
+                         "传统CAGR(%)": None, "滚动CAGR(%)": None})
     return pd.DataFrame(rows)
 
 
@@ -1089,11 +1081,10 @@ with tab1:
                 c11.metric("年化", f"{res['cagr_roll']:.2f}%")
 
                 st.subheader("年均线 MA250")
-                c12, c13, c14, c15 = st.columns(4)
+                c12, c13, c14 = st.columns(3)
                 c12.metric("指数点位", f"{res['ma250_pred']:,.0f}" if pd.notna(res['ma250_pred']) else "—")
                 c13.metric("预估价格", f"{res['ma250_pred_etf']:.4f}" if pd.notna(res['ma250_pred_etf']) else "—")
                 c14.metric("偏离度", f"{res['dev_ma250']:+.2f}%" if pd.notna(res['dev_ma250']) else "—", delta_color="inverse")
-                c15.metric("年化", f"{res['cagr_ma250']:.2f}%" if pd.notna(res['cagr_ma250']) else "—")
             except Exception as e:
                 st.error(f"计算出错：{e}")
 
