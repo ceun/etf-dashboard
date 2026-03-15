@@ -545,7 +545,7 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     df['Roll_Pred_Price'] = np.exp(rolling_preds)
     df['Roll_Z_Score']    = rolling_z
 
-    # MA 年均线（可调窗口）
+    # MA（可调窗口）
     df['MA_Price'] = df['Close'].rolling(window=ma_window, min_periods=ma_window).mean()
     ma_log_diff = np.full(len(df), np.nan)
     ma_mask = df['MA_Price'].notna() & (df['MA_Price'] > 0)
@@ -571,7 +571,7 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     ax1.plot(df['Date'], df['Roll_Pred_Price'], color='blue', linestyle='-.',
              linewidth=1.5, label=f'滚动回归({rolling_window}日)')
     ax1.plot(df['Date'], df['MA_Price'], color='#2F9E44', linestyle='-',
-             linewidth=1.5, label=f'年均线(MA{ma_window})')
+             linewidth=1.5, label=f'MA{ma_window}')
     ax1.set_yscale('log')
     ax1.set_title(f'{etf_name} 全收益', fontsize=15, fontweight='bold')
     ax1.set_ylabel('点位（对数）', fontsize=11)
@@ -705,10 +705,10 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
         hovertemplate='%{x|%Y-%m-%d}  滚动: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
 
-    # ── MA 年均线 ───────────────────────────────────────────────
+    # ── MA ────────────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['MA_Price'],
-        name=f'年均线 (MA{ma_window})',
+        name=f'MA{ma_window}',
         line=dict(color=C_MA, width=1.35, dash='solid'),
         hovertemplate='%{x|%Y-%m-%d}  MA: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
@@ -1107,7 +1107,7 @@ with tab1:
                 c10.metric("偏离度", f"{res['dev_roll']:+.2f}%", delta_color="inverse")
                 c11.metric("年化", f"{res['cagr_roll']:.2f}%")
 
-                st.subheader(f"年均线 MA{ma_window}")
+                st.subheader(f"MA{ma_window}")
                 c12, c13, c14 = st.columns(3)
                 c12.metric("指数点位", f"{res['ma_pred']:,.0f}" if pd.notna(res['ma_pred']) else "—")
                 c13.metric("预估价格", f"{res['ma_pred_etf']:.4f}" if pd.notna(res['ma_pred_etf']) else "—")
