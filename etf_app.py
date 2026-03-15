@@ -24,8 +24,7 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="今天买什么", page_icon="📈", layout="wide")
 
 # ─── 全局配置 ────────────────────────────────────────────────────────────────
-TRADITION_START = "20081031"
-TRADITION_END   = "20221031"
+DEFAULT_TRADITION_START = pd.to_datetime("20081031", format="%Y%m%d").date()
 ROLLING_WINDOW  = 1250
 # Supabase 连接字符串（从 Streamlit secrets 读取）
 DATABASE_URL_POOLER = st.secrets.get("database_url_pooler", None)
@@ -507,14 +506,16 @@ def get_data(etf_code: str):
 
 
 # ─── 核心分析 ─────────────────────────────────────────────────────────────────
-def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0, unadj_factor=1.0):
+def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, scaling_factor=1.0, unadj_factor=1.0):
     df = df.copy()
     df['Log_Close'] = np.log(df['Close'])
     df['Time_Idx']  = np.arange(len(df))
+    tradition_start_dt = pd.to_datetime(tradition_start)
+    tradition_end_dt = pd.to_datetime(tradition_end)
 
     # 传统回归
-    mask = (df['Date'] >= pd.to_datetime(TRADITION_START)) & \
-           (df['Date'] <= pd.to_datetime(TRADITION_END))
+    mask = (df['Date'] >= tradition_start_dt) & \
+           (df['Date'] <= tradition_end_dt)
     sample_df = df[mask]
     if len(sample_df) < 100:
         raise ValueError(f"传统回归样本不足（{len(sample_df)} 条），请检查数据起止日期")
@@ -562,7 +563,7 @@ def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0, unadj_fact
                                    gridspec_kw={'height_ratios': [2.5, 1]})
     ax1.plot(df['Date'], df['Close'], color='black', linewidth=1.2, label='指数')
     ax1.plot(df['Date'], df['Trad_Pred_Price'], color='red', linestyle='--',
-             linewidth=2, label=f'传统回归({TRADITION_START[:4]}-{TRADITION_END[:4]})')
+             linewidth=2, label=f'传统回归({tradition_start_dt.year}-{tradition_end_dt.year})')
     ax1.fill_between(df['Date'],
                      np.exp(df['Trad_Pred_Log'] - 2 * std_trad),
                      np.exp(df['Trad_Pred_Log'] + 2 * std_trad),
@@ -648,12 +649,14 @@ def compute_and_plot(df, etf_name, deviation_pct, scaling_factor=1.0, unadj_fact
     }
 
 
-def render_native_charts(res, etf_name, deviation_pct):
+def render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end):
     """使用 Plotly 渲染，现代简洁风格，含置信带、对数坐标、悬停。"""
     df       = res['plot_df'].copy()
     z_plus   = float(res['z_plus'])
     z_minus  = float(res['z_minus'])
     std_trad = float(res['std_trad'])
+    tradition_start_dt = pd.to_datetime(tradition_start)
+    tradition_end_dt = pd.to_datetime(tradition_end)
 
     # 传统回归置信带（对数空间 ±2σ）
     band_upper = np.exp(df['Trad_Pred_Log'] + 2 * std_trad)
@@ -689,7 +692,7 @@ def render_native_charts(res, etf_name, deviation_pct):
     # ── 传统回归线（虚线）────────────────────────────────────────────
     fig.add_trace(go.Scatter(
         x=df['Date'], y=df['Trad_Pred_Price'],
-        name=f'传统回归 ({TRADITION_START[:4]}–{TRADITION_END[:4]})',
+        name=f'传统回归 ({tradition_start_dt.year}–{tradition_end_dt.year})',
         line=dict(color=C_TRAD, width=1.35, dash='solid'),
         hovertemplate='%{x|%Y-%m-%d}  传统: %{y:,.1f}<extra></extra>',
     ), row=1, col=1)
@@ -796,7 +799,7 @@ def render_native_charts(res, etf_name, deviation_pct):
 
 
 # ─── 全市场对比 ───────────────────────────────────────────────────────────────
-def build_comparison(deviation_pct, etf_config):
+def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end):
     rows = []
     for name, cfg in etf_config.items():
         try:
@@ -814,7 +817,7 @@ def build_comparison(deviation_pct, etf_config):
                          "传统CAGR(%)": None, "滚动CAGR(%)": None})
             continue
         try:
-            fig, res = compute_and_plot(df, name, deviation_pct, scaling_factor)
+            fig, res = compute_and_plot(df, name, deviation_pct, tradition_start, tradition_end, scaling_factor)
             plt.close(fig)
             rows.append({
                 "标的": name, "ETF代码": cfg['etf_code'],
@@ -978,6 +981,8 @@ if "etf_config_runtime" not in st.session_state:
 ACTIVE_ETF_CONFIG = st.session_state["etf_config_runtime"]
 deviation_pct = 15
 selected = None
+tradition_start = DEFAULT_TRADITION_START
+tradition_end = pd.Timestamp.today().date()
 
 with st.sidebar:
     st.header("⚙️ 参数设置")
@@ -992,6 +997,27 @@ with st.sidebar:
     else:
         selected = st.selectbox("选择标的", list(ACTIVE_ETF_CONFIG.keys()))
         deviation_pct = st.slider("偏离阈值 (%)", 5, 30, 15, 1)
+
+        with st.expander("传统回归区间（可调）", expanded=False):
+            today = pd.Timestamp.today().date()
+            tradition_start = st.date_input(
+                "起始日期",
+                value=DEFAULT_TRADITION_START,
+                min_value=DEFAULT_TRADITION_START,
+                max_value=today,
+                key="tradition_start_date",
+            )
+            tradition_end = st.date_input(
+                "结束日期",
+                value=today,
+                min_value=DEFAULT_TRADITION_START,
+                max_value=today,
+                key="tradition_end_date",
+            )
+            st.caption("旧固定区间参考：20081031-20221031")
+            if tradition_start > tradition_end:
+                st.warning("起始日期不能晚于结束日期，已自动调整为结束日期。")
+                tradition_start = tradition_end
 
     st.divider()
     if st.button("🔄 更新全部数据", use_container_width=True, type="primary"):
@@ -1050,8 +1076,8 @@ with tab1:
         else:
             try:
                 unadj_factor, factor_source = get_unadj_factor_from_baostock(etf_code)
-                fig, res = compute_and_plot(df, etf_name, deviation_pct, scaling_factor, unadj_factor)
-                render_native_charts(res, etf_name, deviation_pct)
+                fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, scaling_factor, unadj_factor)
+                render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end)
                 plt.close(fig)
 
                 if factor_source != "baostock":
@@ -1094,7 +1120,7 @@ with tab2:
     else:
         st.caption("对比数据来自数据库，更新请点击侧边栏「更新全部数据」")
         with st.spinner("计算全市场偏离度..."):
-            compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG)
+            compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG, tradition_start, tradition_end)
 
         if compare_df.empty:
             st.info("无数据，请先拼接入库。")
