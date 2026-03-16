@@ -258,6 +258,11 @@ def _to_baostock_code(etf_code):
     return f"sz.{s}"
 
 
+def _short_error_text(err):
+    msg = str(err).replace("\n", " ").strip()
+    return msg[:160]
+
+
 def _save_unadj_factor_cache(etf_code, unadj_factor, factor_source):
     conn = get_db_connection()
     if not conn:
@@ -277,8 +282,8 @@ def _save_unadj_factor_cache(etf_code, unadj_factor, factor_source):
         )
         conn.commit()
         cur.close()
-    except Exception as e:
-        st.warning(f"复权因子缓存写入失败({etf_code}): {e}")
+    except Exception:
+        pass
     finally:
         conn.close()
 
@@ -306,8 +311,7 @@ def _load_unadj_factor_cache(etf_code):
             return None
         source = str(row[1]).strip() if row[1] else "db-cache"
         return float(factor), source
-    except Exception as e:
-        st.caption(f"⚠️ 复权因子缓存读取失败({etf_code}): {e}")
+    except Exception:
         return None
     finally:
         conn.close()
@@ -317,11 +321,16 @@ def get_unadj_factor_from_baostock(etf_code):
     """
     优先使用 baostock query_adjust_factor 获取“后复权 -> 不复权”换算系数。
     回退顺序：baostock -> akshare 推算 -> 数据库最近可用缓存 -> baostock-empty。
-    返回 (factor, source_msg)，其中 factor 满足: unadj ~= hfq * factor。
+    返回 (factor, source_msg, status_msg)，其中 factor 满足: unadj ~= hfq * factor。
     """
+    status_parts = []
+
     if bs is not None:
         login_res = bs.login()
-        if getattr(login_res, 'error_code', '1') == '0':
+        login_code = getattr(login_res, 'error_code', '1')
+        login_msg = getattr(login_res, 'error_msg', '')
+        status_parts.append(f"baostock-login={login_code}:{login_msg}")
+        if login_code == '0':
             try:
                 bs_code = _to_baostock_code(etf_code)
                 rs = bs.query_adjust_factor(
@@ -332,6 +341,9 @@ def get_unadj_factor_from_baostock(etf_code):
                 rows = []
                 while rs.error_code == '0' and rs.next():
                     rows.append(rs.get_row_data())
+                status_parts.append(
+                    f"baostock-query={rs.error_code}:{rs.error_msg},rows={len(rows)}"
+                )
 
                 if rows:
                     df_factor = pd.DataFrame(rows, columns=rs.fields)
@@ -352,14 +364,21 @@ def get_unadj_factor_from_baostock(etf_code):
                     if raw is not None and raw > 0:
                         factor = 1.0 / raw
                         _save_unadj_factor_cache(etf_code, factor, 'baostock')
-                        return float(factor), 'baostock'
-            except Exception:
-                pass
+                        return float(factor), 'baostock', "；".join(status_parts)
+                    status_parts.append("baostock-factor-invalid")
+                else:
+                    status_parts.append("baostock-empty")
+            except Exception as e:
+                status_parts.append(f"baostock-exception={_short_error_text(e)}")
             finally:
                 try:
                     bs.logout()
                 except Exception:
                     pass
+        else:
+            status_parts.append("baostock-login-failed")
+    else:
+        status_parts.append("baostock-import-unavailable")
 
     try:
         hfq_latest, unadj_latest = fetch_latest_ak_hfq_unadj(etf_code)
@@ -367,16 +386,22 @@ def get_unadj_factor_from_baostock(etf_code):
             factor = float(unadj_latest) / float(hfq_latest)
             if factor > 0:
                 _save_unadj_factor_cache(etf_code, factor, 'akshare')
-                return factor, 'akshare-fallback'
-    except Exception:
-        pass
+                status_parts.append("akshare-fallback=ok")
+                return factor, 'akshare-fallback', "；".join(status_parts)
+            status_parts.append("akshare-fallback=invalid")
+        else:
+            status_parts.append("akshare-fallback=hfq<=0")
+    except Exception as e:
+        status_parts.append(f"akshare-fallback-error={_short_error_text(e)}")
 
     cached = _load_unadj_factor_cache(etf_code)
     if cached is not None:
         cached_factor, cached_source = cached
-        return float(cached_factor), f"db-last-good:{cached_source}"
+        status_parts.append(f"db-cache-hit={cached_source}")
+        return float(cached_factor), f"db-last-good:{cached_source}", "；".join(status_parts)
 
-    return 1.0, 'baostock-empty'
+    status_parts.append("db-cache-miss")
+    return 1.0, 'baostock-empty', "；".join(status_parts)
 
 
 def _get_target_name(etf_code, default_name=None):
@@ -1073,18 +1098,24 @@ with st.sidebar:
                     continue
 
                 try:
-                    _, factor_source = get_unadj_factor_from_baostock(cfg['etf_code'])
-                    factor_source_records.append((name, factor_source))
+                    _, factor_source, factor_status = get_unadj_factor_from_baostock(cfg['etf_code'])
+                    factor_source_records.append((name, factor_source, factor_status))
                 except Exception as e:
                     st.warning(f"{name} 因子刷新失败: {e}")
             prog.progress((idx + 1) / len(etf_list))
 
         if factor_source_records:
             source_counts = {}
-            for _, src in factor_source_records:
+            for _, src, _ in factor_source_records:
                 source_counts[src] = source_counts.get(src, 0) + 1
             summary = "；".join([f"{src}: {cnt}" for src, cnt in source_counts.items()])
             st.caption(f"本次复权因子刷新来源统计：{summary}")
+            with st.expander("查看 baostock 运行状态与错误详情"):
+                factor_status_df = pd.DataFrame(
+                    factor_source_records,
+                    columns=['标的', '因子来源', 'baostock状态'],
+                )
+                st.dataframe(factor_status_df, hide_index=True, use_container_width=True)
 
         st.success("✅ 全部数据已更新！")
         st.rerun()
@@ -1130,7 +1161,7 @@ with tab1:
             st.error("数据不足，无法计算回归，请先在「数据管理」中上传历史指数文件并拼接。")
         else:
             try:
-                unadj_factor, factor_source = get_unadj_factor_from_baostock(etf_code)
+                unadj_factor, factor_source, factor_status = get_unadj_factor_from_baostock(etf_code)
                 fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor, unadj_factor)
                 render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window)
                 plt.close(fig)
@@ -1139,6 +1170,7 @@ with tab1:
                     st.caption(f"ETF价格展示口径：不复权（因子来源: {factor_source}）")
                 else:
                     st.caption("ETF价格展示口径：不复权（因子来源: baostock query_adjust_factor）")
+                st.caption(f"baostock运行状态：{factor_status}")
 
                 st.divider()
                 st.subheader("指数点位 & ETF价格")
