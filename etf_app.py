@@ -1061,13 +1061,30 @@ with st.sidebar:
         st.cache_data.clear()
         prog = st.progress(0)
         etf_list = list(ACTIVE_ETF_CONFIG.items())
+        factor_source_records = []
         for idx, (name, cfg) in enumerate(etf_list):
             with st.spinner(f"拉取 {name}..."):
                 try:
                     sync_data_from_akshare(cfg['etf_code'])
                 except Exception as e:
                     st.warning(f"{name} 失败: {e}")
+                    prog.progress((idx + 1) / len(etf_list))
+                    continue
+
+                try:
+                    _, factor_source = get_unadj_factor_from_baostock(cfg['etf_code'])
+                    factor_source_records.append((name, factor_source))
+                except Exception as e:
+                    st.warning(f"{name} 因子刷新失败: {e}")
             prog.progress((idx + 1) / len(etf_list))
+
+        if factor_source_records:
+            source_counts = {}
+            for _, src in factor_source_records:
+                source_counts[src] = source_counts.get(src, 0) + 1
+            summary = "；".join([f"{src}: {cnt}" for src, cnt in source_counts.items()])
+            st.caption(f"本次复权因子刷新来源统计：{summary}")
+
         st.success("✅ 全部数据已更新！")
         st.rerun()
 
