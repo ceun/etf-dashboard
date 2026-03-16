@@ -9,14 +9,13 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import akshare as ak
 import streamlit as st
 from urllib.parse import urlparse, parse_qs, unquote
 
 try:
-    import baostock as bs
+    from thsdk import THS
 except Exception:
-    bs = None
+    THS = None
 
 warnings.filterwarnings('ignore')
 
@@ -232,35 +231,173 @@ def load_from_db(etf_code):
         conn.close()
 
 
-# ─── AkShare ──────────────────────────────────────────────────────────────────
-def fetch_all_from_akshare(etf_code):
-    """拉取 ETF 后复权全量日线，返回 DataFrame(Date, ETF_Close)"""
-    raw = ak.fund_etf_hist_em(symbol=etf_code, period="daily", adjust="hfq")
-    raw['日期'] = pd.to_datetime(raw['日期'])
-    df = raw[['日期', '收盘']].rename(columns={'日期': 'Date', '收盘': 'ETF_Close'})
-    return df.sort_values('Date').reset_index(drop=True)
+# ─── THSDK ───────────────────────────────────────────────────────────────────
+def _ensure_thsdk_available():
+    if THS is None:
+        raise RuntimeError("未安装 thsdk，无法拉取ETF行情。请先安装：pip install thsdk")
+
+
+def _extract_date_close(df):
+    if df is None or df.empty:
+        raise ValueError("返回数据为空")
+
+    date_col = None
+    close_col = None
+    for col in df.columns:
+        col_lower = str(col).lower()
+        if date_col is None and ("时间" in col_lower or "日期" in col_lower or col_lower == "date"):
+            date_col = col
+        if close_col is None and ("收盘" in col_lower or col_lower == "close"):
+            close_col = col
+
+    if date_col is None:
+        date_col = "时间" if "时间" in df.columns else None
+    if close_col is None:
+        close_col = "收盘" if "收盘" in df.columns else None
+
+    if date_col is None or close_col is None:
+        raise ValueError(f"无法识别K线日期/收盘列，当前列: {list(df.columns)}")
+
+    out = df[[date_col, close_col]].copy()
+    out.columns = ["Date", "Close"]
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
+    out = out.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
+    if out.empty:
+        raise ValueError("K线清洗后无可用数据")
+    return out
+
+
+def _extract_ths_code_from_df(df, etf_code):
+    if df is None or df.empty:
+        return None
+    code_col = None
+    for col in ["代码", "code", "Code", "ths_code", "证券代码"]:
+        if col in df.columns:
+            code_col = col
+            break
+    if code_col is None:
+        return None
+
+    code_series = df[code_col].astype(str).str.strip().str.upper()
+    matched = code_series[code_series.str.endswith(str(etf_code).strip()) & code_series.str.startswith("US")]
+    if not matched.empty:
+        return matched.iloc[0]
+    full = code_series[code_series.str.startswith("US") & (code_series.str.len() == 10)]
+    if not full.empty:
+        return full.iloc[0]
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def resolve_thsdk_etf_code(etf_code):
+    _ensure_thsdk_available()
+    s = str(etf_code).strip().upper()
+    if s.startswith("US") and len(s) == 10:
+        return s
+
+    with THS() as ths:
+        resp = ths.query_securities(pattern=s, needmarket="SH,SZ")
+        if resp and not getattr(resp, "error", "") and hasattr(resp, "df"):
+            code = _extract_ths_code_from_df(resp.df, s)
+            if code:
+                return code
+
+        resp = ths.fund_etf_lists()
+        if resp and not getattr(resp, "error", "") and hasattr(resp, "df"):
+            code = _extract_ths_code_from_df(resp.df, s)
+            if code:
+                return code
+
+    raise ValueError(f"thsdk 未找到ETF代码映射: {etf_code}")
+
+
+def fetch_all_from_thsdk(etf_code):
+    """拉取 ETF 后复权全量日线，返回 DataFrame(Date, ETF_Close)。"""
+    _ensure_thsdk_available()
+    ths_code = resolve_thsdk_etf_code(etf_code)
+    with THS() as ths:
+        resp = ths.klines(ths_code=ths_code, adjust="backward", interval="day", count=-1)
+        if (not resp) or getattr(resp, "error", ""):
+            raise RuntimeError(getattr(resp, "error", "thsdk 返回失败"))
+        parsed = _extract_date_close(resp.df)
+    return parsed.rename(columns={"Close": "ETF_Close"})
+
+
+def fetch_recent_from_thsdk(etf_code, count=30):
+    """拉取 ETF 后复权近期日线，默认 30 条，返回 DataFrame(Date, ETF_Close)。"""
+    _ensure_thsdk_available()
+    ths_code = resolve_thsdk_etf_code(etf_code)
+    with THS() as ths:
+        resp = ths.klines(ths_code=ths_code, adjust="backward", interval="day", count=int(count))
+        if (not resp) or getattr(resp, "error", ""):
+            raise RuntimeError(getattr(resp, "error", "thsdk 返回失败"))
+        parsed = _extract_date_close(resp.df)
+    return parsed.rename(columns={"Close": "ETF_Close"})
+
+
+def _cn_today_date():
+    return pd.Timestamp.now(tz="Asia/Shanghai").date()
+
+
+def _exclude_today_rows(df, date_col="Date"):
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    today = _cn_today_date()
+    return work[work[date_col].dt.date < today].copy()
+
+
+def _keep_last_n_trading_days(df, n=3, date_col="Date"):
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    trade_days = sorted(work[date_col].dt.date.dropna().unique())
+    if len(trade_days) <= n:
+        return work.sort_values(date_col).reset_index(drop=True)
+    keep_days = set(trade_days[-n:])
+    return work[work[date_col].dt.date.isin(keep_days)].sort_values(date_col).reset_index(drop=True)
+
+
+def _delete_today_prices_from_db(etf_code):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        today = _cn_today_date()
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM etf_prices WHERE etf_code=%s AND date >= %s",
+            (str(etf_code).strip(), today),
+        )
+        conn.commit()
+        cur.close()
+    except Exception:
+        pass
+    finally:
+        conn.close()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_latest_ak_hfq_unadj(etf_code):
-    """返回 AkShare 最新 (hfq, unadj) 收盘价，用于对齐显示口径。"""
-    hfq_raw = ak.fund_etf_hist_em(symbol=etf_code, period="daily", adjust="hfq")
-    unadj_raw = ak.fund_etf_hist_em(symbol=etf_code, period="daily", adjust="")
-    hfq_latest = float(hfq_raw.sort_values('日期').iloc[-1]['收盘'])
-    unadj_latest = float(unadj_raw.sort_values('日期').iloc[-1]['收盘'])
-    return hfq_latest, unadj_latest
+def fetch_recent_thsdk_hfq_unadj(etf_code, count=30):
+    """返回 THSDK 近期后复权/不复权收盘，列为 Date、HFQ_Close、UNADJ_Close。"""
+    _ensure_thsdk_available()
+    ths_code = resolve_thsdk_etf_code(etf_code)
+    with THS() as ths:
+        hfq_resp = ths.klines(ths_code=ths_code, adjust="backward", interval="day", count=int(count))
+        unadj_resp = ths.klines(ths_code=ths_code, adjust="", interval="day", count=int(count))
+        if (not hfq_resp) or getattr(hfq_resp, "error", ""):
+            raise RuntimeError(getattr(hfq_resp, "error", "thsdk 后复权查询失败"))
+        if (not unadj_resp) or getattr(unadj_resp, "error", ""):
+            raise RuntimeError(getattr(unadj_resp, "error", "thsdk 不复权查询失败"))
+        hfq_df = _extract_date_close(hfq_resp.df)
+        unadj_df = _extract_date_close(unadj_resp.df)
 
-
-def _to_baostock_code(etf_code):
-    s = str(etf_code).strip()
-    if s.startswith(('5', '6', '9')):
-        return f"sh.{s}"
-    return f"sz.{s}"
-
-
-def _short_error_text(err):
-    msg = str(err).replace("\n", " ").strip()
-    return msg[:160]
+    merged = pd.merge(
+        hfq_df.rename(columns={"Close": "HFQ_Close"}),
+        unadj_df.rename(columns={"Close": "UNADJ_Close"}),
+        on="Date",
+        how="inner",
+    ).sort_values("Date").reset_index(drop=True)
+    return merged
 
 
 def _save_unadj_factor_cache(etf_code, unadj_factor, factor_source):
@@ -317,91 +454,46 @@ def _load_unadj_factor_cache(etf_code):
         conn.close()
 
 
-def get_unadj_factor_from_baostock(etf_code):
+def get_unadj_factor(etf_code):
     """
-    优先使用 baostock query_adjust_factor 获取“后复权 -> 不复权”换算系数。
-    回退顺序：baostock -> akshare 推算 -> 数据库最近可用缓存 -> baostock-empty。
-    返回 (factor, source_msg, status_msg)，其中 factor 满足: unadj ~= hfq * factor。
+    使用 THSDK 计算“后复权 -> 不复权”换算系数。
+    策略：优先使用当日因子（仅内存使用，不落盘）；
+    当日不可用时，优先使用昨日已落盘因子；若缓存缺失，再用最新可用历史日因子并落盘。
+    返回 (factor, source_msg)，其中 factor 满足: unadj ~= hfq * factor。
     """
-    status_parts = []
-
-    if bs is not None:
-        login_res = bs.login()
-        login_code = getattr(login_res, 'error_code', '1')
-        login_msg = getattr(login_res, 'error_msg', '')
-        status_parts.append(f"baostock-login={login_code}:{login_msg}")
-        if login_code == '0':
-            try:
-                bs_code = _to_baostock_code(etf_code)
-                rs = bs.query_adjust_factor(
-                    code=bs_code,
-                    start_date="1990-01-01",
-                    end_date=pd.Timestamp.today().strftime('%Y-%m-%d'),
-                )
-                rows = []
-                while rs.error_code == '0' and rs.next():
-                    rows.append(rs.get_row_data())
-                status_parts.append(
-                    f"baostock-query={rs.error_code}:{rs.error_msg},rows={len(rows)}"
-                )
-
-                if rows:
-                    df_factor = pd.DataFrame(rows, columns=rs.fields)
-                    if 'dividOperateDate' in df_factor.columns:
-                        df_factor['dividOperateDate'] = pd.to_datetime(df_factor['dividOperateDate'], errors='coerce')
-                        latest = df_factor.sort_values('dividOperateDate').iloc[-1]
-                    else:
-                        latest = df_factor.iloc[-1]
-
-                    raw = None
-                    for col in ('backAdjustFactor', 'adjustFactor', 'foreAdjustFactor'):
-                        if col in df_factor.columns and pd.notna(latest.get(col)):
-                            num = pd.to_numeric(latest.get(col), errors='coerce')
-                            if pd.notna(num) and float(num) > 0:
-                                raw = float(num)
-                                break
-
-                    if raw is not None and raw > 0:
-                        factor = 1.0 / raw
-                        _save_unadj_factor_cache(etf_code, factor, 'baostock')
-                        return float(factor), 'baostock', "；".join(status_parts)
-                    status_parts.append("baostock-factor-invalid")
-                else:
-                    status_parts.append("baostock-empty")
-            except Exception as e:
-                status_parts.append(f"baostock-exception={_short_error_text(e)}")
-            finally:
-                try:
-                    bs.logout()
-                except Exception:
-                    pass
-        else:
-            status_parts.append("baostock-login-failed")
-    else:
-        status_parts.append("baostock-import-unavailable")
-
+    today = _cn_today_date()
     try:
-        hfq_latest, unadj_latest = fetch_latest_ak_hfq_unadj(etf_code)
-        if hfq_latest > 0:
-            factor = float(unadj_latest) / float(hfq_latest)
-            if factor > 0:
-                _save_unadj_factor_cache(etf_code, factor, 'akshare')
-                status_parts.append("akshare-fallback=ok")
-                return factor, 'akshare-fallback', "；".join(status_parts)
-            status_parts.append("akshare-fallback=invalid")
-        else:
-            status_parts.append("akshare-fallback=hfq<=0")
-    except Exception as e:
-        status_parts.append(f"akshare-fallback-error={_short_error_text(e)}")
+        merged = fetch_recent_thsdk_hfq_unadj(etf_code, count=30)
+        if not merged.empty:
+            merged['Date'] = pd.to_datetime(merged['Date'])
+            merged = merged[(merged['HFQ_Close'] > 0) & (merged['UNADJ_Close'] > 0)].copy()
+            if not merged.empty:
+                merged['factor'] = merged['UNADJ_Close'] / merged['HFQ_Close']
+
+                today_rows = merged[merged['Date'].dt.date == today]
+                prev_rows = merged[merged['Date'].dt.date < today]
+
+                if not prev_rows.empty:
+                    yrow = prev_rows.sort_values('Date').iloc[-1]
+                    yfactor = float(yrow['factor'])
+                    if yfactor > 0:
+                        ydate = yrow['Date'].strftime('%Y-%m-%d')
+                        _save_unadj_factor_cache(etf_code, yfactor, f"thsdk-yday:{ydate}")
+
+                if not today_rows.empty:
+                    trow = today_rows.sort_values('Date').iloc[-1]
+                    tfactor = float(trow['factor'])
+                    if tfactor > 0:
+                        return tfactor, 'thsdk-today-not-saved'
+    except Exception:
+        pass
 
     cached = _load_unadj_factor_cache(etf_code)
     if cached is not None:
         cached_factor, cached_source = cached
-        status_parts.append(f"db-cache-hit={cached_source}")
-        return float(cached_factor), f"db-last-good:{cached_source}", "；".join(status_parts)
+        return float(cached_factor), f"db-yesterday:{cached_source}"
 
-    status_parts.append("db-cache-miss")
-    return 1.0, 'baostock-empty', "；".join(status_parts)
+    return 1.0, 'default-1.0'
 
 
 def _get_target_name(etf_code, default_name=None):
@@ -446,7 +538,7 @@ def _check_needs_full_stitch(etf_code):
 
 
 def _full_stitch_from_db(etf_code):
-    """完整拼接：从 DB 读取 index_close 数据，拉取 AkShare 全量，计算 scaling_factor 并更新所有行"""
+    """完整拼接：从 DB 读取 index_close 数据，拉取 THSDK 全量，计算 scaling_factor 并更新所有行"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -465,11 +557,14 @@ def _full_stitch_from_db(etf_code):
         df_hist['Date'] = pd.to_datetime(df_hist['date'])
         df_hist = df_hist.rename(columns={'index_close': 'index_close_val'})[['Date', 'index_close_val']]
         
-        # 拉取 AkShare 完整历史
-        ak_df = fetch_all_from_akshare(etf_code)
+        # 拉取 THSDK 完整历史
+        etf_df = fetch_all_from_thsdk(etf_code)
+        etf_df = _exclude_today_rows(etf_df, date_col='Date')
+        if etf_df.empty:
+            return False
         
         # 查找重叠日期计算缩放比例
-        merged = pd.merge(df_hist, ak_df, on='Date', how='inner')
+        merged = pd.merge(df_hist, etf_df, on='Date', how='inner')
         if merged.empty:
             return False
         
@@ -479,12 +574,12 @@ def _full_stitch_from_db(etf_code):
         
         # 构造拼接结果：历史段 + 新增段
         hist_part = df_hist.copy()
-        hist_part = pd.merge(hist_part, ak_df, on='Date', how='left')
+        hist_part = pd.merge(hist_part, etf_df, on='Date', how='left')
         hist_part = hist_part.rename(columns={'index_close_val': 'index_close', 'ETF_Close': 'etf_close'})
         hist_part['combined_close'] = hist_part['index_close']
         
         last_hist_date = df_hist['Date'].max()
-        new_part = ak_df[ak_df['Date'] > last_hist_date].copy()
+        new_part = etf_df[etf_df['Date'] > last_hist_date].copy()
         new_part = new_part.rename(columns={'ETF_Close': 'etf_close'})
         new_part['index_close'] = None
         new_part['combined_close'] = new_part['etf_close'] * scaling_factor
@@ -505,40 +600,37 @@ def _full_stitch_from_db(etf_code):
         return False
 
 
-def _incremental_akshare_update(etf_code, scaling_factor):
-    """增量拉取 AkShare 新数据追加到 etf_prices（新行：index_close=NULL）"""
-    conn = get_db_connection()
-    if not conn:
+def _incremental_thsdk_update(etf_code, scaling_factor):
+    """增量刷新：每次覆盖最近三个交易日，且当日数据不落盘。"""
+    recent_all = fetch_recent_from_thsdk(etf_code, count=30)
+    recent_all = _exclude_today_rows(recent_all, date_col='Date')
+    if recent_all.empty:
         return
-    try:
-        res = pd.read_sql(
-            "SELECT MAX(date) AS last_date FROM etf_prices WHERE etf_code=%s",
-            conn, params=(etf_code,),
-        )
-        last_date = pd.to_datetime(res['last_date'].iloc[0]) if not res.empty and pd.notna(res['last_date'].iloc[0]) else None
-    except Exception:
-        last_date = None
-    finally:
-        conn.close()
 
-    new_all  = fetch_all_from_akshare(etf_code)
-    new_data = new_all[new_all['Date'] > last_date].copy() if last_date is not None else new_all.copy()
-    if new_data.empty:
+    patch_data = _keep_last_n_trading_days(recent_all, n=3, date_col='Date')
+    if patch_data.empty:
         return
-    new_data = new_data.rename(columns={'ETF_Close': 'etf_close'})
-    new_data['index_close']    = None
-    new_data['combined_close'] = new_data['etf_close'] * scaling_factor
-    save_prices_to_db(new_data[['Date', 'index_close', 'etf_close', 'combined_close']], etf_code)
+
+    patch_data = patch_data.rename(columns={'ETF_Close': 'etf_close'})
+    patch_data['index_close'] = None
+    patch_data['combined_close'] = patch_data['etf_close'] * scaling_factor
+    save_prices_to_db(patch_data[['Date', 'index_close', 'etf_close', 'combined_close']], etf_code)
 
 
-def sync_data_from_akshare(etf_code: str):
+def sync_data_from_thsdk(etf_code: str):
     """
     仅在手动点击「更新全部数据」时调用：
-    DB 有数据则执行完整拼接检查/增量更新；DB 无数据则全量初始化。
+    DB 有数据则执行完整拼接检查/近三交易日回补；DB 无数据则全量初始化。
+    规则：当日行情不落盘，仅落昨日及更早数据。
     """
+    _delete_today_prices_from_db(etf_code)
+
     df, scaling_factor = load_from_db(etf_code)
     if df is None:
-        raw = fetch_all_from_akshare(etf_code)
+        raw = fetch_all_from_thsdk(etf_code)
+        raw = _exclude_today_rows(raw, date_col='Date')
+        if raw.empty:
+            return load_from_db(etf_code)
         target_name = _get_target_name(etf_code)
         save_target_to_db(etf_code, target_name, scaling_factor=1.0)
         rows = pd.DataFrame({
@@ -553,7 +645,7 @@ def sync_data_from_akshare(etf_code: str):
         if _check_needs_full_stitch(etf_code):
             _full_stitch_from_db(etf_code)
         else:
-            _incremental_akshare_update(etf_code, scaling_factor)
+            _incremental_thsdk_update(etf_code, scaling_factor)
 
     return load_from_db(etf_code)
 
@@ -561,7 +653,7 @@ def sync_data_from_akshare(etf_code: str):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_data(etf_code: str):
     """
-    页面加载只读数据库，不触发任何 AkShare 网络请求。
+    页面加载只读数据库，不触发任何 THSDK 网络请求。
     实时更新请点击侧边栏「更新全部数据」。
     """
     return load_from_db(etf_code)
@@ -981,21 +1073,24 @@ def parse_upload_file(uploaded_file):
         return None, f"❌ 解析文件出错: {e}"
 
 
-def stitch_with_akshare(history_df, etf_code):
+def stitch_with_thsdk(history_df, etf_code):
     """
-    将历史指数数据（history_df: Date, Close=指数点位）与 AkShare ETF 数据拼接。
+    将历史指数数据（history_df: Date, Close=指数点位）与 THSDK ETF 数据拼接。
     返回 (structured_df, scaling_factor, stitch_date, message)
     structured_df 列：Date, index_close, etf_close, combined_close
     
-    注意：本函数用于「已有标的：上传并拼接」流程，需要自动从AkShare拉取数据。
+    注意：本函数用于「已有标的：上传并拼接」流程，需要自动从 THSDK 拉取数据。
     """
     try:
-        ak_df = fetch_all_from_akshare(etf_code)
+        etf_df = fetch_all_from_thsdk(etf_code)
+        etf_df = _exclude_today_rows(etf_df, date_col='Date')
+        if etf_df.empty:
+            return None, 1.0, None, "❌ THSDK暂无可落盘的历史日线（当日数据不会落盘）"
 
-        # 外连接历史和AkShare
+        # 外连接历史和 THSDK
         merged = pd.merge(
             history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}),
-            ak_df.rename(columns={'ETF_Close': 'etf_close'}),
+            etf_df.rename(columns={'ETF_Close': 'etf_close'}),
             on='Date', how='outer',
         ).sort_values('Date')
 
@@ -1009,16 +1104,16 @@ def stitch_with_akshare(history_df, etf_code):
         else:
             scaling_factor = 1.0
             stitch_date    = history_df['Date'].max().date()
-            msg_prefix = "⚠️ 历史数据与 AkShare 无重叠日期，缩放比例暂设为 1.0"
+            msg_prefix = "⚠️ 历史数据与 THSDK 无重叠日期，缩放比例暂设为 1.0"
 
         # 历史段：所有历史日期（index_close有值）
         hist = history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}).copy()
-        hist = pd.merge(hist, ak_df.rename(columns={'ETF_Close': 'etf_close'}), on='Date', how='left')
+        hist = pd.merge(hist, etf_df.rename(columns={'ETF_Close': 'etf_close'}), on='Date', how='left')
         hist['combined_close'] = hist['index_close']
 
-        # 近期段：AkShare 独有日期（晚于历史最新日期）
+        # 近期段：THSDK 独有日期（晚于历史最新日期）
         last_hist = history_df['Date'].max()
-        recent = ak_df[ak_df['Date'] > last_hist].copy()
+        recent = etf_df[etf_df['Date'] > last_hist].copy()
         recent = recent.rename(columns={'ETF_Close': 'etf_close'})
         recent['index_close']    = None
         recent['combined_close'] = recent['etf_close'] * scaling_factor
@@ -1091,31 +1186,25 @@ with st.sidebar:
         for idx, (name, cfg) in enumerate(etf_list):
             with st.spinner(f"拉取 {name}..."):
                 try:
-                    sync_data_from_akshare(cfg['etf_code'])
+                    sync_data_from_thsdk(cfg['etf_code'])
                 except Exception as e:
                     st.warning(f"{name} 失败: {e}")
                     prog.progress((idx + 1) / len(etf_list))
                     continue
 
                 try:
-                    _, factor_source, factor_status = get_unadj_factor_from_baostock(cfg['etf_code'])
-                    factor_source_records.append((name, factor_source, factor_status))
+                    _, factor_source = get_unadj_factor(cfg['etf_code'])
+                    factor_source_records.append((name, factor_source))
                 except Exception as e:
                     st.warning(f"{name} 因子刷新失败: {e}")
             prog.progress((idx + 1) / len(etf_list))
 
         if factor_source_records:
             source_counts = {}
-            for _, src, _ in factor_source_records:
+            for _, src in factor_source_records:
                 source_counts[src] = source_counts.get(src, 0) + 1
             summary = "；".join([f"{src}: {cnt}" for src, cnt in source_counts.items()])
             st.caption(f"本次复权因子刷新来源统计：{summary}")
-            with st.expander("查看 baostock 运行状态与错误详情"):
-                factor_status_df = pd.DataFrame(
-                    factor_source_records,
-                    columns=['标的', '因子来源', 'baostock状态'],
-                )
-                st.dataframe(factor_status_df, hide_index=True, use_container_width=True)
 
         st.success("✅ 全部数据已更新！")
         st.rerun()
@@ -1161,16 +1250,12 @@ with tab1:
             st.error("数据不足，无法计算回归，请先在「数据管理」中上传历史指数文件并拼接。")
         else:
             try:
-                unadj_factor, factor_source, factor_status = get_unadj_factor_from_baostock(etf_code)
+                unadj_factor, factor_source = get_unadj_factor(etf_code)
                 fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor, unadj_factor)
                 render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window)
                 plt.close(fig)
 
-                if factor_source != "baostock":
-                    st.caption(f"ETF价格展示口径：不复权（因子来源: {factor_source}）")
-                else:
-                    st.caption("ETF价格展示口径：不复权（因子来源: baostock query_adjust_factor）")
-                st.caption(f"baostock运行状态：{factor_status}")
+                st.caption(f"ETF价格展示口径：不复权（因子来源: {factor_source}）")
 
                 st.divider()
                 st.subheader("指数点位 & ETF价格")
@@ -1329,7 +1414,8 @@ with tab3:
                     else:
                         etf_code = ACTIVE_ETF_CONFIG[selected_etf]['etf_code']
                         with st.spinner("正在拼接并保存..."):
-                            df_combined, scaling_factor, stitch_date, msg = stitch_with_akshare(df_uploaded, etf_code)
+                            df_combined, scaling_factor, stitch_date, msg = stitch_with_thsdk(df_uploaded, etf_code)
+                            
                         st.info(msg)
 
                         if df_combined is not None:
@@ -1341,7 +1427,7 @@ with tab3:
 
     else:
         st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数历史文件，三者必填）")
-        st.caption("说明：新增时只保存指数历史数据；点击「更新全部数据」时会自动从 AkShare 拉取并拼接。")
+        st.caption("说明：新增时只保存指数历史数据；点击「更新全部数据」时会自动从 THSDK 拉取并拼接。")
 
         col_name, col_code = st.columns(2)
         with col_name:
@@ -1386,5 +1472,5 @@ with tab3:
                         }
                         st.cache_data.clear()
                         st.success(f"✅ 已新增：{target_name} ↔ {target_code}，指数历史已保存")
-                        st.info("💡 点击「更新全部数据」会自动从 AkShare 拉取并拼接，计算正确的缩放比例")
+                        st.info("💡 点击「更新全部数据」会自动从 THSDK 拉取并拼接，计算正确的缩放比例")
                         st.rerun()
