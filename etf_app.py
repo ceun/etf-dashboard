@@ -258,88 +258,124 @@ def _to_baostock_code(etf_code):
     return f"sz.{s}"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+def _save_unadj_factor_cache(etf_code, unadj_factor, factor_source):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO etf_unadj_factor_cache (etf_code, unadj_factor, factor_source, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (etf_code) DO UPDATE SET
+                unadj_factor = EXCLUDED.unadj_factor,
+                factor_source = EXCLUDED.factor_source,
+                updated_at = NOW()
+            """,
+            (str(etf_code).strip(), float(unadj_factor), str(factor_source)),
+        )
+        conn.commit()
+        cur.close()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def _load_unadj_factor_cache(etf_code):
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT unadj_factor, factor_source
+            FROM etf_unadj_factor_cache
+            WHERE etf_code = %s
+            """,
+            (str(etf_code).strip(),),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        factor = pd.to_numeric(row[0], errors='coerce')
+        if pd.isna(factor) or float(factor) <= 0:
+            return None
+        source = str(row[1]).strip() if row[1] else "db-cache"
+        return float(factor), source
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def get_unadj_factor_from_baostock(etf_code):
     """
-    使用 baostock query_adjust_factor 估算“后复权 -> 不复权”的换算系数。
+    优先使用 baostock query_adjust_factor 获取“后复权 -> 不复权”换算系数。
+    回退顺序：baostock -> akshare 推算 -> 数据库最近可用缓存 -> baostock-empty。
     返回 (factor, source_msg)，其中 factor 满足: unadj ~= hfq * factor。
     """
-    # 先拿 AkShare 比值做方向校准（避免因子方向理解差异）
-    ak_ratio = None
+    if bs is not None:
+        login_res = bs.login()
+        if getattr(login_res, 'error_code', '1') == '0':
+            try:
+                bs_code = _to_baostock_code(etf_code)
+                rs = bs.query_adjust_factor(
+                    code=bs_code,
+                    start_date="1990-01-01",
+                    end_date=pd.Timestamp.today().strftime('%Y-%m-%d'),
+                )
+                rows = []
+                while rs.error_code == '0' and rs.next():
+                    rows.append(rs.get_row_data())
+
+                if rows:
+                    df_factor = pd.DataFrame(rows, columns=rs.fields)
+                    if 'dividOperateDate' in df_factor.columns:
+                        df_factor['dividOperateDate'] = pd.to_datetime(df_factor['dividOperateDate'], errors='coerce')
+                        latest = df_factor.sort_values('dividOperateDate').iloc[-1]
+                    else:
+                        latest = df_factor.iloc[-1]
+
+                    raw = None
+                    for col in ('backAdjustFactor', 'adjustFactor', 'foreAdjustFactor'):
+                        if col in df_factor.columns and pd.notna(latest.get(col)):
+                            num = pd.to_numeric(latest.get(col), errors='coerce')
+                            if pd.notna(num) and float(num) > 0:
+                                raw = float(num)
+                                break
+
+                    if raw is not None and raw > 0:
+                        factor = 1.0 / raw
+                        _save_unadj_factor_cache(etf_code, factor, 'baostock')
+                        return float(factor), 'baostock'
+            except Exception:
+                pass
+            finally:
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
+
     try:
         hfq_latest, unadj_latest = fetch_latest_ak_hfq_unadj(etf_code)
         if hfq_latest > 0:
-            ak_ratio = unadj_latest / hfq_latest
+            factor = float(unadj_latest) / float(hfq_latest)
+            if factor > 0:
+                _save_unadj_factor_cache(etf_code, factor, 'akshare')
+                return factor, 'akshare-fallback'
     except Exception:
-        ak_ratio = None
+        pass
 
-    if bs is None:
-        if ak_ratio is not None:
-            return float(ak_ratio), "akshare-fallback"
-        return 1.0, "no-baostock"
+    cached = _load_unadj_factor_cache(etf_code)
+    if cached is not None:
+        cached_factor, cached_source = cached
+        return float(cached_factor), f"db-last-good:{cached_source}"
 
-    login_res = bs.login()
-    if getattr(login_res, 'error_code', '1') != '0':
-        if ak_ratio is not None:
-            return float(ak_ratio), "akshare-fallback"
-        return 1.0, "baostock-login-failed"
-
-    try:
-        bs_code = _to_baostock_code(etf_code)
-        rs = bs.query_adjust_factor(
-            code=bs_code,
-            start_date="1990-01-01",
-            end_date=pd.Timestamp.today().strftime('%Y-%m-%d'),
-        )
-        rows = []
-        while rs.error_code == '0' and rs.next():
-            rows.append(rs.get_row_data())
-
-        if not rows:
-            if ak_ratio is not None:
-                return float(ak_ratio), "akshare-fallback"
-            return 1.0, "baostock-empty"
-
-        df_factor = pd.DataFrame(rows, columns=rs.fields)
-        if 'dividOperateDate' in df_factor.columns:
-            df_factor['dividOperateDate'] = pd.to_datetime(df_factor['dividOperateDate'], errors='coerce')
-            latest = df_factor.sort_values('dividOperateDate').iloc[-1]
-        else:
-            latest = df_factor.iloc[-1]
-
-        raw = None
-        for col in ('backAdjustFactor', 'adjustFactor', 'foreAdjustFactor'):
-            if col in df_factor.columns and pd.notna(latest.get(col)):
-                raw = pd.to_numeric(latest.get(col), errors='coerce')
-                if pd.notna(raw):
-                    raw = float(raw)
-                    break
-
-        if raw is None or raw <= 0:
-            if ak_ratio is not None:
-                return float(ak_ratio), "akshare-fallback"
-            return 1.0, "baostock-invalid"
-
-        cand_mul = raw
-        cand_div = 1.0 / raw
-
-        # 用 AkShare 当日比值选择更合理方向
-        if ak_ratio is not None:
-            if abs(cand_mul - ak_ratio) <= abs(cand_div - ak_ratio):
-                return float(cand_mul), "baostock"
-            return float(cand_div), "baostock"
-
-        # 无法校准时优先使用 1/raw（常见情形：hfq = unadj * factor）
-        return float(cand_div), "baostock"
-    except Exception:
-        if ak_ratio is not None:
-            return float(ak_ratio), "akshare-fallback"
-        return 1.0, "baostock-exception"
-    finally:
-        try:
-            bs.logout()
-        except Exception:
-            pass
+    return 1.0, 'baostock-empty'
 
 
 def _get_target_name(etf_code, default_name=None):
