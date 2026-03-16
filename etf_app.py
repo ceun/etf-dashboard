@@ -268,25 +268,46 @@ def _extract_date_close(df):
     return out
 
 
-def _extract_ths_code_from_df(df, etf_code):
-    if df is None or df.empty:
-        return None
-    code_col = None
-    for col in ["代码", "code", "Code", "ths_code", "证券代码"]:
+def _pick_first_existing_column(df, candidates):
+    for col in candidates:
         if col in df.columns:
-            code_col = col
-            break
-    if code_col is None:
-        return None
-
-    code_series = df[code_col].astype(str).str.strip().str.upper()
-    matched = code_series[code_series.str.endswith(str(etf_code).strip()) & code_series.str.startswith("US")]
-    if not matched.empty:
-        return matched.iloc[0]
-    full = code_series[code_series.str.startswith("US") & (code_series.str.len() == 10)]
-    if not full.empty:
-        return full.iloc[0]
+            return col
     return None
+
+
+def _extract_exact_thsdk_etf_codes(df, etf_code):
+    if df is None or df.empty:
+        return []
+
+    code_col = _pick_first_existing_column(df, ["代码", "code", "Code", "ths_code", "证券代码"])
+    if code_col is None:
+        return []
+
+    work = df.copy()
+    target = str(etf_code).strip().upper()
+    work["_ths_code"] = work[code_col].astype(str).str.strip().str.upper()
+    work = work[work["_ths_code"].str.startswith("US")].copy()
+    if work.empty:
+        return []
+
+    work["_raw_code"] = work["_ths_code"].str.extract(r"(\d{6})$", expand=False)
+    work = work[work["_raw_code"] == target].copy()
+    if work.empty:
+        return []
+
+    type_cols = ["类型", "证券类型", "type", "分类", "市场类型"]
+    name_cols = ["名称", "name", "Name", "证券简称"]
+    marker_cols = [col for col in type_cols + name_cols if col in work.columns]
+    if marker_cols:
+        etf_mask = pd.Series(False, index=work.index)
+        for col in marker_cols:
+            text = work[col].astype(str)
+            etf_mask = etf_mask | text.str.contains(r"ETF|基金", case=False, na=False)
+        if etf_mask.any():
+            work = work[etf_mask].copy()
+
+    codes = sorted(work["_ths_code"].dropna().unique().tolist())
+    return codes
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -299,15 +320,19 @@ def resolve_thsdk_etf_code(etf_code):
     with THS() as ths:
         resp = ths.query_securities(pattern=s, needmarket="SH,SZ")
         if resp and not getattr(resp, "error", "") and hasattr(resp, "df"):
-            code = _extract_ths_code_from_df(resp.df, s)
-            if code:
-                return code
+            codes = _extract_exact_thsdk_etf_codes(resp.df, s)
+            if len(codes) == 1:
+                return codes[0]
+            if len(codes) > 1:
+                raise ValueError(f"thsdk ETF代码映射存在歧义: {etf_code} -> {codes}")
 
         resp = ths.fund_etf_lists()
         if resp and not getattr(resp, "error", "") and hasattr(resp, "df"):
-            code = _extract_ths_code_from_df(resp.df, s)
-            if code:
-                return code
+            codes = _extract_exact_thsdk_etf_codes(resp.df, s)
+            if len(codes) == 1:
+                return codes[0]
+            if len(codes) > 1:
+                raise ValueError(f"thsdk ETF列表映射存在歧义: {etf_code} -> {codes}")
 
     raise ValueError(f"thsdk 未找到ETF代码映射: {etf_code}")
 
