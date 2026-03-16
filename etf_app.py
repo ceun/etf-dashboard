@@ -277,8 +277,8 @@ def _save_unadj_factor_cache(etf_code, unadj_factor, factor_source):
         )
         conn.commit()
         cur.close()
-    except Exception:
-        pass
+    except Exception as e:
+        st.warning(f"复权因子缓存写入失败({etf_code}): {e}")
     finally:
         conn.close()
 
@@ -306,7 +306,8 @@ def _load_unadj_factor_cache(etf_code):
             return None
         source = str(row[1]).strip() if row[1] else "db-cache"
         return float(factor), source
-    except Exception:
+    except Exception as e:
+        st.caption(f"⚠️ 复权因子缓存读取失败({etf_code}): {e}")
         return None
     finally:
         conn.close()
