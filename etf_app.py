@@ -1,5 +1,6 @@
 import os
 import socket
+import json
 import psycopg2
 from psycopg2.extras import execute_values
 import warnings
@@ -11,7 +12,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import akshare as ak
 import streamlit as st
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, quote
+from urllib.request import Request, urlopen
 
 warnings.filterwarnings('ignore')
 
@@ -85,13 +87,13 @@ def get_db_connection():
 
 # ─── 标的元数据 ───────────────────────────────────────────────────────────────
 def load_targets_from_db():
-    """从 etf_targets 读取所有标的，返回 {name: {etf_code, name, scaling_factor}}"""
+    """从 etf_targets 读取所有标的，返回 {name: {etf_code, name, index_code, scaling_factor}}"""
     conn = get_db_connection()
     if not conn:
         return {}
     try:
         df = pd.read_sql(
-            "SELECT etf_code, name, scaling_factor FROM etf_targets ORDER BY name",
+            "SELECT etf_code, name, index_code, scaling_factor FROM etf_targets ORDER BY name",
             conn,
         )
         if df.empty:
@@ -100,6 +102,7 @@ def load_targets_from_db():
             row['name']: {
                 "name": row['name'],
                 "etf_code": str(row['etf_code']),
+                "index_code": str(row['index_code']).strip() if pd.notna(row['index_code']) else "",
                 "scaling_factor": float(row['scaling_factor']) if pd.notna(row['scaling_factor']) else 1.0,
             }
             for _, row in df.iterrows()
@@ -339,6 +342,112 @@ def fetch_recent_from_akshare(etf_code, count=30):
     return df.tail(int(count)).reset_index(drop=True)
 
 
+def _normalize_index_code(index_code):
+    if index_code is None:
+        return ""
+    return str(index_code).strip().upper()
+
+
+def _is_szse_index_code(index_code):
+    code = _normalize_index_code(index_code)
+    return code.startswith("CN") or code.startswith("399")
+
+
+def _http_get_json(url, timeout=12):
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req, timeout=timeout) as resp:
+        text = resp.read().decode("utf-8", errors="ignore")
+    return json.loads(text)
+
+
+def fetch_szse_index_daily(index_code, start_date="1991-01-01", end_date="2050-01-01"):
+    """从深证/国证公开接口拉取指数日线（Date, Index_Close）。"""
+    code = _normalize_index_code(index_code)
+    if not code:
+        return pd.DataFrame(columns=["Date", "Index_Close"])
+
+    url = (
+        "https://hq.cnindex.com.cn/market/market/getIndexDailyData"
+        f"?indexCode={quote(code)}&startDate={quote(str(start_date))}&endDate={quote(str(end_date))}"
+    )
+    payload = _http_get_json(url)
+    if payload.get("code") != 200:
+        raise RuntimeError(f"深证指数接口失败: {payload.get('message')}")
+
+    data_root = payload.get("data") or {}
+    rows = data_root.get("data") or []
+    if not rows:
+        return pd.DataFrame(columns=["Date", "Index_Close"])
+
+    parsed = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 6:
+            continue
+        ts = pd.to_numeric(row[0], errors="coerce")
+        close = pd.to_numeric(row[5], errors="coerce")
+        if pd.isna(ts) or pd.isna(close):
+            continue
+        parsed.append((pd.to_datetime(int(ts), unit="ms"), float(close)))
+
+    if not parsed:
+        return pd.DataFrame(columns=["Date", "Index_Close"])
+
+    out = pd.DataFrame(parsed, columns=["Date", "Index_Close"]).dropna()
+    return out.sort_values("Date").reset_index(drop=True)
+
+
+def _estimate_scaling_factor_from_overlap(index_df, etf_code, default_sf=1.0):
+    """用最近重叠窗口的中位数比值估算缩放比例，提升 ETF 价格换算稳定性。"""
+    try:
+        etf_recent = fetch_recent_from_akshare(etf_code, count=400)
+        if etf_recent.empty:
+            return float(default_sf)
+        merged = pd.merge(
+            index_df[["Date", "Index_Close"]],
+            etf_recent[["Date", "ETF_Close"]],
+            on="Date",
+            how="inner",
+        )
+        if merged.empty:
+            return float(default_sf)
+        merged = merged[(merged["Index_Close"] > 0) & (merged["ETF_Close"] > 0)].copy()
+        if merged.empty:
+            return float(default_sf)
+        merged["ratio"] = merged["Index_Close"] / merged["ETF_Close"]
+        ratio = pd.to_numeric(merged["ratio"], errors="coerce").dropna()
+        if ratio.empty:
+            return float(default_sf)
+        sf = float(ratio.tail(250).median())
+        return sf if sf > 0 else float(default_sf)
+    except Exception:
+        return float(default_sf)
+
+
+def _estimate_scaling_from_merged(merged_df, index_col, etf_col, default_sf=1.0, window=250):
+    """从重叠样本估算缩放比例：使用最近窗口 ratio 的中位数（多点拟合）。"""
+    if merged_df is None or merged_df.empty:
+        return float(default_sf), None, 0
+    work = merged_df.copy()
+    work = work[(pd.to_numeric(work[index_col], errors="coerce") > 0) & (pd.to_numeric(work[etf_col], errors="coerce") > 0)].copy()
+    if work.empty:
+        return float(default_sf), None, 0
+    work["ratio"] = pd.to_numeric(work[index_col], errors="coerce") / pd.to_numeric(work[etf_col], errors="coerce")
+    work = work.dropna(subset=["ratio"]).sort_values("Date")
+    if work.empty:
+        return float(default_sf), None, 0
+
+    sample = work.tail(int(window)).copy()
+    ratio = pd.to_numeric(sample["ratio"], errors="coerce").dropna()
+    if ratio.empty:
+        return float(default_sf), None, 0
+
+    sf = float(ratio.median())
+    if sf <= 0:
+        return float(default_sf), None, 0
+    stitch_date = sample["Date"].max().date() if "Date" in sample.columns else None
+    return sf, stitch_date, int(len(sample))
+
+
 def _cn_today_date():
     return pd.Timestamp.now(tz="Asia/Shanghai").date()
 
@@ -520,6 +629,64 @@ def _get_target_name(etf_code, default_name=None):
         return default_name or etf_code
 
 
+def _get_target_meta(etf_code, default_name=None):
+    """读取标的元数据，返回 dict(name, index_code, scaling_factor)。"""
+    conn = get_db_connection()
+    fallback = {
+        "name": default_name or etf_code,
+        "index_code": "",
+        "scaling_factor": 1.0,
+    }
+    if not conn:
+        return fallback
+    try:
+        res = pd.read_sql(
+            "SELECT name, index_code, scaling_factor FROM etf_targets WHERE etf_code=%s",
+            conn,
+            params=(etf_code,),
+        )
+        conn.close()
+        if res.empty:
+            return fallback
+        row = res.iloc[0]
+        return {
+            "name": row["name"] if pd.notna(row["name"]) else fallback["name"],
+            "index_code": _normalize_index_code(row["index_code"]) if pd.notna(row["index_code"]) else "",
+            "scaling_factor": float(row["scaling_factor"]) if pd.notna(row["scaling_factor"]) else 1.0,
+        }
+    except Exception:
+        return fallback
+
+
+def _sync_data_from_szse_index(etf_code: str, index_code: str):
+    """深证指数直连同步：指数点位直接入库，避免 ETF 反推误差。"""
+    _delete_today_prices_from_db(etf_code)
+    hist = fetch_szse_index_daily(index_code=index_code, start_date="1991-01-01", end_date="2050-01-01")
+    hist = _exclude_today_rows(hist, date_col="Date")
+    if hist.empty:
+        raise RuntimeError(f"深证指数无可落盘数据: {index_code}")
+
+    meta = _get_target_meta(etf_code)
+    sf = _estimate_scaling_factor_from_overlap(hist, etf_code, default_sf=meta["scaling_factor"])
+
+    rows = pd.DataFrame({
+        "Date": hist["Date"],
+        "index_close": hist["Index_Close"],
+        "etf_close": None,
+        "combined_close": hist["Index_Close"],
+    })
+    save_prices_to_db(rows[["Date", "index_close", "etf_close", "combined_close"]], etf_code)
+
+    target_name = meta["name"]
+    save_target_to_db(
+        etf_code,
+        target_name,
+        index_code=index_code,
+        scaling_factor=sf,
+        stitch_date=hist["Date"].max().date(),
+    )
+
+
 def _check_needs_full_stitch(etf_code):
     """检查标的是否需要完整拼接（历史数据 etf_close 全为 NULL 但 index_close 有值）"""
     conn = get_db_connection()
@@ -569,14 +736,20 @@ def _full_stitch_from_db(etf_code):
         if etf_df.empty:
             return False
         
-        # 查找重叠日期计算缩放比例
+        # 用重叠窗口多点拟合缩放比例（避免单点锚定偏差）
         merged = pd.merge(df_hist, etf_df, on='Date', how='inner')
         if merged.empty:
             return False
-        
-        anchor = merged.iloc[-1]
-        scaling_factor = float(anchor['index_close_val']) / float(anchor['ETF_Close'])
-        stitch_date = anchor['Date'].date()
+
+        scaling_factor, stitch_date, _ = _estimate_scaling_from_merged(
+            merged,
+            index_col='index_close_val',
+            etf_col='ETF_Close',
+            default_sf=1.0,
+            window=250,
+        )
+        if stitch_date is None:
+            return False
         
         # 构造拼接结果：历史段 + 新增段
         hist_part = df_hist.copy()
@@ -626,9 +799,16 @@ def _incremental_akshare_update(etf_code, scaling_factor):
 def sync_data_from_akshare(etf_code: str):
     """
     仅在手动点击「更新全部数据」时调用：
-    DB 有数据则执行完整拼接检查/近三交易日回补；DB 无数据则全量初始化。
+    若配置深证指数代码则优先直连深证接口；否则走 ETF 拼接/回补链路。
     规则：当日行情不落盘，仅落昨日及更早数据。
     """
+    meta = _get_target_meta(etf_code)
+    index_code = _normalize_index_code(meta.get("index_code"))
+
+    if _is_szse_index_code(index_code):
+        _sync_data_from_szse_index(etf_code, index_code)
+        return load_from_db(etf_code)
+
     _delete_today_prices_from_db(etf_code)
 
     df, scaling_factor = load_from_db(etf_code)
@@ -638,7 +818,7 @@ def sync_data_from_akshare(etf_code: str):
         if raw.empty:
             return load_from_db(etf_code)
         target_name = _get_target_name(etf_code)
-        save_target_to_db(etf_code, target_name, scaling_factor=1.0)
+        save_target_to_db(etf_code, target_name, scaling_factor=1.0, index_code=index_code or None)
         rows = pd.DataFrame({
             'Date':           raw['Date'],
             'index_close':    None,
@@ -1100,13 +1280,22 @@ def stitch_with_akshare(history_df, etf_code):
             on='Date', how='outer',
         ).sort_values('Date')
 
-        # 找最后一个两列都有值的日期（锚点）来计算缩放比例，找不到就用1.0
+        # 使用重叠窗口多点拟合缩放比例，找不到重叠样本才回落到 1.0
         overlap = merged[merged['index_close'].notna() & merged['etf_close'].notna()]
         if not overlap.empty:
-            anchor         = overlap.iloc[-1]
-            scaling_factor = float(anchor['index_close']) / float(anchor['etf_close'])
-            stitch_date    = anchor['Date'].date()
-            msg_prefix = f"✅ 拼接成功，缩放比例: {scaling_factor:.4f}"
+            scaling_factor, stitch_date, used_n = _estimate_scaling_from_merged(
+                overlap,
+                index_col='index_close',
+                etf_col='etf_close',
+                default_sf=1.0,
+                window=250,
+            )
+            if stitch_date is None:
+                scaling_factor = 1.0
+                stitch_date = history_df['Date'].max().date()
+                msg_prefix = "⚠️ 重叠样本无有效价格，缩放比例暂设为 1.0"
+            else:
+                msg_prefix = f"✅ 拼接成功，缩放比例: {scaling_factor:.4f}（多点拟合样本: {used_n}）"
         else:
             scaling_factor = 1.0
             stitch_date    = history_df['Date'].max().date()
@@ -1425,21 +1614,29 @@ with tab3:
                         st.info(msg)
 
                         if df_combined is not None:
-                            save_target_to_db(etf_code, selected_etf, scaling_factor=scaling_factor, stitch_date=stitch_date)
+                            save_target_to_db(
+                                etf_code,
+                                selected_etf,
+                                scaling_factor=scaling_factor,
+                                stitch_date=stitch_date,
+                                index_code=(ACTIVE_ETF_CONFIG[selected_etf].get("index_code") or None),
+                            )
                             save_prices_to_db(df_combined, etf_code)
                             st.session_state["etf_config_runtime"][selected_etf]['scaling_factor'] = scaling_factor
                             st.cache_data.clear()
                             st.success(f"✅ {selected_etf} 已拼接并保存，共 {len(df_combined)} 条")
 
     else:
-        st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数历史文件，三者必填）")
-        st.caption("说明：新增时只保存指数历史数据；点击「更新全部数据」时会自动从 AkShare 拉取并拼接。东方财富优先，新浪兜底。")
+        st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数代码 + 指数历史文件，四者必填）")
+        st.caption("说明：若指数代码为深证体系（如 CN2324/399xxx），更新时优先走深证接口直连；其他指数走 ETF 拟合。")
 
-        col_name, col_code = st.columns(2)
+        col_name, col_code, col_index = st.columns(3)
         with col_name:
             new_etf_name = st.text_input("标的名称", placeholder="例如：新etf指数")
         with col_code:
             new_etf_code = st.text_input("关联 ETF 代码", placeholder="例如：159999")
+        with col_index:
+            new_index_code = st.text_input("指数代码", placeholder="例如：CN2324 或 000922")
 
         new_history_file = st.file_uploader(
             "上传该标的的指数历史文件（xlsx/xls/csv）",
@@ -1450,9 +1647,10 @@ with tab3:
         if st.button("➕ 绑定并导入", use_container_width=True, type="primary"):
             target_name = (new_etf_name or "").strip()
             target_code = (new_etf_code or "").strip()
+            target_index_code = _normalize_index_code((new_index_code or "").strip())
 
-            if not target_name or not target_code or new_history_file is None:
-                st.error("❌ 必须同时提供：标的名称、ETF代码、指数历史文件")
+            if not target_name or not target_code or not target_index_code or new_history_file is None:
+                st.error("❌ 必须同时提供：标的名称、ETF代码、指数代码、指数历史文件")
             elif target_name in ACTIVE_ETF_CONFIG:
                 st.error(f"❌ 标的 {target_name} 已存在，请更换名称")
             else:
@@ -1468,15 +1666,22 @@ with tab3:
                         df_to_save['combined_close'] = df_to_save['Close']
                         
                         # 保存元数据和历史数据
-                        save_target_to_db(target_code, target_name, scaling_factor=1.0, stitch_date=df_new['Date'].max().date())
+                        save_target_to_db(
+                            target_code,
+                            target_name,
+                            scaling_factor=1.0,
+                            stitch_date=df_new['Date'].max().date(),
+                            index_code=target_index_code,
+                        )
                         save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close', 'combined_close']], target_code)
                         
                         st.session_state["etf_config_runtime"][target_name] = {
                             "name": target_name,
                             "etf_code": target_code,
+                            "index_code": target_index_code,
                             "scaling_factor": 1.0,
                         }
                         st.cache_data.clear()
-                        st.success(f"✅ 已新增：{target_name} ↔ {target_code}，指数历史已保存")
-                        st.info("💡 点击「更新全部数据」会自动从 AkShare 拉取并拼接，东方财富优先，新浪兜底，并计算正确的缩放比例")
+                        st.success(f"✅ 已新增：{target_name} ↔ {target_code}（指数代码: {target_index_code}），指数历史已保存")
+                        st.info("💡 点击「更新全部数据」后：深证指数优先直连深证接口，其他指数走 ETF 拟合，并自动更新缩放比例")
                         st.rerun()
