@@ -331,13 +331,13 @@ def _fetch_akshare_hist_with_fallback(etf_code, adjust="hfq", allow_sina_fallbac
 
 
 def fetch_all_from_akshare(etf_code):
-    """拉取 ETF 日线，优先东方财富后复权，失败则回退新浪原始日线。"""
-    df, _ = _fetch_akshare_hist_with_fallback(etf_code, adjust="hfq", allow_sina_fallback=True)
+    """拉取 ETF 日线：仅使用东方财富后复权；失败则直接报错。"""
+    df, _ = _fetch_akshare_hist_with_fallback(etf_code, adjust="hfq", allow_sina_fallback=False)
     return df.rename(columns={"Close": "ETF_Close"})
 
 
 def fetch_recent_from_akshare(etf_code, count=30):
-    """拉取 ETF 近期日线，优先东方财富后复权，失败则回退新浪原始日线。"""
+    """拉取 ETF 近期日线：仅使用东方财富后复权。"""
     df = fetch_all_from_akshare(etf_code)
     return df.tail(int(count)).reset_index(drop=True)
 
