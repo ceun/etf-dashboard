@@ -148,7 +148,7 @@ def save_prices_to_db(df, etf_code):
     conn = get_db_connection()
     if not conn:
         st.warning("无法连接数据库，数据未保存")
-        return
+        return 0
     try:
         cur = conn.cursor()
 
@@ -176,7 +176,7 @@ def save_prices_to_db(df, etf_code):
 
         if not rows:
             cur.close()
-            return
+            return 0
 
         sql = """
             INSERT INTO etf_prices (etf_code, date, index_close, etf_close, combined_close)
@@ -194,8 +194,10 @@ def save_prices_to_db(df, etf_code):
 
         conn.commit()
         cur.close()
+        return int(len(rows))
     except Exception as e:
         st.warning(f"保存行情数据异常: {e}")
+        return 0
     finally:
         conn.close()
 
@@ -675,7 +677,7 @@ def _sync_data_from_szse_index(etf_code: str, index_code: str):
         "etf_close": None,
         "combined_close": hist["Index_Close"],
     })
-    save_prices_to_db(rows[["Date", "index_close", "etf_close", "combined_close"]], etf_code)
+    written_rows = save_prices_to_db(rows[["Date", "index_close", "etf_close", "combined_close"]], etf_code)
 
     target_name = meta["name"]
     save_target_to_db(
@@ -685,6 +687,7 @@ def _sync_data_from_szse_index(etf_code: str, index_code: str):
         scaling_factor=sf,
         stitch_date=hist["Date"].max().date(),
     )
+    return int(written_rows)
 
 
 def _check_needs_full_stitch(etf_code):
@@ -770,13 +773,13 @@ def _full_stitch_from_db(etf_code):
         ).sort_values('Date').reset_index(drop=True)
         
         # 更新 DB
-        save_prices_to_db(result, etf_code)
+        written_rows = save_prices_to_db(result, etf_code)
         target_name = _get_target_name(etf_code)
         save_target_to_db(etf_code, target_name, scaling_factor=scaling_factor, stitch_date=stitch_date)
         
-        return True
+        return int(written_rows)
     except Exception as e:
-        return False
+        return 0
 
 
 def _incremental_akshare_update(etf_code, scaling_factor):
@@ -784,16 +787,16 @@ def _incremental_akshare_update(etf_code, scaling_factor):
     recent_all = fetch_recent_from_akshare(etf_code, count=30)
     recent_all = _exclude_today_rows(recent_all, date_col='Date')
     if recent_all.empty:
-        return
+        return 0
 
     patch_data = _keep_last_n_trading_days(recent_all, n=3, date_col='Date')
     if patch_data.empty:
-        return
+        return 0
 
     patch_data = patch_data.rename(columns={'ETF_Close': 'etf_close'})
     patch_data['index_close'] = None
     patch_data['combined_close'] = patch_data['etf_close'] * scaling_factor
-    save_prices_to_db(patch_data[['Date', 'index_close', 'etf_close', 'combined_close']], etf_code)
+    return int(save_prices_to_db(patch_data[['Date', 'index_close', 'etf_close', 'combined_close']], etf_code))
 
 
 def sync_data_from_akshare(etf_code: str):
@@ -806,17 +809,20 @@ def sync_data_from_akshare(etf_code: str):
     index_code = _normalize_index_code(meta.get("index_code"))
 
     if _is_szse_index_code(index_code):
-        _sync_data_from_szse_index(etf_code, index_code)
-        return load_from_db(etf_code)
+        written_rows = _sync_data_from_szse_index(etf_code, index_code)
+        df_latest, scaling_factor_latest = load_from_db(etf_code)
+        return df_latest, scaling_factor_latest, int(written_rows)
 
     _delete_today_prices_from_db(etf_code)
 
     df, scaling_factor = load_from_db(etf_code)
+    written_rows = 0
     if df is None:
         raw = fetch_all_from_akshare(etf_code)
         raw = _exclude_today_rows(raw, date_col='Date')
         if raw.empty:
-            return load_from_db(etf_code)
+            df_latest, scaling_factor_latest = load_from_db(etf_code)
+            return df_latest, scaling_factor_latest, 0
         target_name = _get_target_name(etf_code)
         save_target_to_db(etf_code, target_name, scaling_factor=1.0, index_code=index_code or None)
         rows = pd.DataFrame({
@@ -825,15 +831,16 @@ def sync_data_from_akshare(etf_code: str):
             'etf_close':      raw['ETF_Close'],
             'combined_close': raw['ETF_Close'],
         })
-        save_prices_to_db(rows, etf_code)
+        written_rows = save_prices_to_db(rows, etf_code)
     else:
         # 检查是否需要完整拼接（历史数据未初始化 etf_close）
         if _check_needs_full_stitch(etf_code):
-            _full_stitch_from_db(etf_code)
+            written_rows = _full_stitch_from_db(etf_code)
         else:
-            _incremental_akshare_update(etf_code, scaling_factor)
+            written_rows = _incremental_akshare_update(etf_code, scaling_factor)
 
-    return load_from_db(etf_code)
+    df_latest, scaling_factor_latest = load_from_db(etf_code)
+    return df_latest, scaling_factor_latest, int(written_rows)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1381,7 +1388,11 @@ with st.sidebar:
         for idx, (name, cfg) in enumerate(etf_list):
             with st.spinner(f"拉取 {name}..."):
                 try:
-                    sync_data_from_akshare(cfg['etf_code'])
+                    _, _, written_rows = sync_data_from_akshare(cfg['etf_code'])
+                    if written_rows > 0:
+                        st.caption(f"🗄️ {name} 本次落库 {written_rows} 条")
+                    else:
+                        st.caption(f"🗄️ {name} 本次无新增落库")
                 except Exception as e:
                     st.warning(f"{name} 失败: {e}")
                     prog.progress((idx + 1) / len(etf_list))
@@ -1621,10 +1632,11 @@ with tab3:
                                 stitch_date=stitch_date,
                                 index_code=(ACTIVE_ETF_CONFIG[selected_etf].get("index_code") or None),
                             )
-                            save_prices_to_db(df_combined, etf_code)
+                            written_rows = save_prices_to_db(df_combined, etf_code)
                             st.session_state["etf_config_runtime"][selected_etf]['scaling_factor'] = scaling_factor
                             st.cache_data.clear()
                             st.success(f"✅ {selected_etf} 已拼接并保存，共 {len(df_combined)} 条")
+                            st.caption(f"🗄️ 本次落库 {written_rows} 条")
 
     else:
         st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数代码 + 指数历史文件，四者必填）")
@@ -1673,7 +1685,7 @@ with tab3:
                             stitch_date=df_new['Date'].max().date(),
                             index_code=target_index_code,
                         )
-                        save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close', 'combined_close']], target_code)
+                        written_rows = save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close', 'combined_close']], target_code)
                         
                         st.session_state["etf_config_runtime"][target_name] = {
                             "name": target_name,
@@ -1683,5 +1695,6 @@ with tab3:
                         }
                         st.cache_data.clear()
                         st.success(f"✅ 已新增：{target_name} ↔ {target_code}（指数代码: {target_index_code}），指数历史已保存")
+                        st.caption(f"🗄️ 本次落库 {written_rows} 条")
                         st.info("💡 点击「更新全部数据」后：深证指数优先直连深证接口，其他指数走 ETF 拟合，并自动更新缩放比例")
                         st.rerun()
