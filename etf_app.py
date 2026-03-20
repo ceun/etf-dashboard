@@ -1218,43 +1218,6 @@ def stitch_with_tickflow(history_df, etf_code):
         return None, 1.0, None, f"❌ 拼接失败: {e}"
 
 
-def force_refresh_scaling_factor(etf_code):
-    """手动触发：从数据库读取已有重叠数据，重新拟合 scaling_factor 并更新库表"""
-    conn = get_db_connection()
-    if not conn:
-        return False, "数据库连接失败"
-    try:
-        df = pd.read_sql(
-            "SELECT date AS \"Date\", index_close, etf_close_raw FROM etf_prices WHERE etf_code=%s",
-            conn, params=(etf_code,)
-        )
-        if df.empty:
-            return False, "数据库无该标的行情数据"
-        
-        df['Date'] = pd.to_datetime(df['Date'])
-        
-        # 利用数据库中已有行情进行 250 天中位数拟合
-        sf, stitch_date, used_n = _estimate_scaling_from_merged(
-            df, index_col='index_close', etf_col='etf_close_raw', default_sf=1.0, window=250
-        )
-        if used_n == 0:
-            return False, "未找到有效的历史指数与ETF重叠数据，无法计算"
-            
-        cur = conn.cursor()
-        # 更新元数据表里的系数
-        cur.execute("UPDATE etf_targets SET scaling_factor=%s, stitch_date=%s WHERE etf_code=%s", (sf, stitch_date, etf_code))
-        # 用新系数重新换算 ETF独有时间段 的合成收盘价 (index_close为空的部分)
-        cur.execute("""
-            UPDATE etf_prices SET combined_close = etf_close_raw * %s 
-            WHERE etf_code=%s AND index_close IS NULL AND etf_close_raw IS NOT NULL
-        """, (sf, etf_code))
-        conn.commit()
-        return True, f"成功刷新！最新换算系数为: {sf:.4f} (基于 {used_n} 天重叠数据)"
-    except Exception as e:
-        return False, f"刷新失败: {e}"
-    finally:
-        conn.close()
-
 
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
 st.title("📈 今天买什么")
@@ -1493,7 +1456,7 @@ with tab3:
 
     mode = st.radio(
         "选择操作模式",
-        ["已有标的：上传并拼接", "新增标的：绑定并导入", "刷新换算系数"],
+        ["已有标的：上传并拼接", "新增标的：绑定并导入"],
         horizontal=True,
     )
 
@@ -1546,23 +1509,6 @@ with tab3:
                             st.cache_data.clear()
                             st.success(f"✅ {selected_etf} 已拼接并保存，共 {len(df_combined)} 条")
                             st.caption(f"🗄️ 本次落库 {written_rows} 条")
-
-    elif mode == "刷新换算系数":
-        st.write("**利用数据库中已存的指数和ETF重叠行情，重新计算并更新该标的的换算系数（Scaling Factor）**")
-        if not ACTIVE_ETF_CONFIG:
-            st.info("暂无标的，请先新增标的。")
-        else:
-            refresh_etf = st.selectbox("选择要刷新的标的", list(ACTIVE_ETF_CONFIG.keys()), key="refresh_etf")
-            
-            if st.button("🔄 重新计算并更新", use_container_width=True, type="primary"):
-                etf_code = ACTIVE_ETF_CONFIG[refresh_etf]['etf_code']
-                with st.spinner("正在重新计算换算系数并更新历史价格..."):
-                    success, msg = force_refresh_scaling_factor(etf_code)
-                if success:
-                    st.success(msg)
-                    st.cache_data.clear()  # 清理页面缓存以便图表立即生效
-                else:
-                    st.error(msg)
 
     else:
         st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数代码 + 指数历史文件，四者必填）")
