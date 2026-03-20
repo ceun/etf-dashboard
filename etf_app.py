@@ -1231,6 +1231,8 @@ def force_refresh_scaling_factor(etf_code):
         if df.empty:
             return False, "数据库无该标的行情数据"
         
+        df['Date'] = pd.to_datetime(df['Date'])
+        
         # 利用数据库中已有行情进行 250 天中位数拟合
         sf, stitch_date, used_n = _estimate_scaling_from_merged(
             df, index_col='index_close', etf_col='etf_close_raw', default_sf=1.0, window=250
