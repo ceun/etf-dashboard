@@ -143,8 +143,8 @@ def save_target_to_db(etf_code, name, scaling_factor=None, stitch_date=None, ind
 
 def save_prices_to_db(df, etf_code):
     """
-    写入 etf_prices。df 需含 Date、combined_close，可含 index_close、etf_close。
-    冲突时：index_close/etf_close 保留原值（COALESCE），combined_close 直接覆盖。
+    写入 etf_prices。df 需含 Date、combined_close，可含 index_close、etf_close_raw、etf_close_hfq。
+    冲突时：价格列按新值优先回填，combined_close 直接覆盖。
     """
     conn = get_db_connection()
     if not conn:
@@ -157,21 +157,25 @@ def save_prices_to_db(df, etf_code):
         work = df.copy()
         if 'index_close' not in work.columns:
             work['index_close'] = None
-        if 'etf_close' not in work.columns:
-            work['etf_close'] = None
+        if 'etf_close_raw' not in work.columns:
+            work['etf_close_raw'] = None
+        if 'etf_close_hfq' not in work.columns:
+            work['etf_close_hfq'] = None
 
         work['Date'] = pd.to_datetime(work['Date'])
         work['index_close'] = pd.to_numeric(work['index_close'], errors='coerce')
-        work['etf_close'] = pd.to_numeric(work['etf_close'], errors='coerce')
+        work['etf_close_raw'] = pd.to_numeric(work['etf_close_raw'], errors='coerce')
+        work['etf_close_hfq'] = pd.to_numeric(work['etf_close_hfq'], errors='coerce')
         work['combined_close'] = pd.to_numeric(work['combined_close'], errors='coerce')
 
         rows = []
-        for _, row in work[['Date', 'index_close', 'etf_close', 'combined_close']].iterrows():
+        for _, row in work[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'combined_close']].iterrows():
             rows.append((
                 etf_code,
                 row['Date'].date(),
                 None if pd.isna(row['index_close']) else float(row['index_close']),
-                None if pd.isna(row['etf_close']) else float(row['etf_close']),
+                None if pd.isna(row['etf_close_raw']) else float(row['etf_close_raw']),
+                None if pd.isna(row['etf_close_hfq']) else float(row['etf_close_hfq']),
                 float(row['combined_close']),
             ))
 
@@ -180,11 +184,12 @@ def save_prices_to_db(df, etf_code):
             return 0
 
         sql = """
-            INSERT INTO etf_prices (etf_code, date, index_close, etf_close, combined_close)
+            INSERT INTO etf_prices (etf_code, date, index_close, etf_close_raw, etf_close_hfq, combined_close)
             VALUES %s
             ON CONFLICT (etf_code, date) DO UPDATE SET
-                index_close    = COALESCE(EXCLUDED.index_close, etf_prices.index_close),
-                etf_close      = COALESCE(EXCLUDED.etf_close,   etf_prices.etf_close),
+                index_close    = COALESCE(EXCLUDED.index_close,    etf_prices.index_close),
+                etf_close_raw  = COALESCE(EXCLUDED.etf_close_raw,  etf_prices.etf_close_raw),
+                etf_close_hfq  = COALESCE(EXCLUDED.etf_close_hfq,  etf_prices.etf_close_hfq),
                 combined_close = EXCLUDED.combined_close
         """
 
@@ -204,13 +209,22 @@ def save_prices_to_db(df, etf_code):
 
 
 def load_from_db(etf_code):
-    """返回 (df[Date, Close], scaling_factor)，Close 对应 combined_close"""
+    """返回 (df, scaling_factor)：df含 Date、Close(combined_close)、ETF_Close_Raw、ETF_Close_HFQ。"""
     conn = get_db_connection()
     if not conn:
         return None, 1.0
     try:
         df = pd.read_sql(
-            "SELECT date, combined_close FROM etf_prices WHERE etf_code=%s ORDER BY date",
+            """
+            SELECT
+                date,
+                combined_close,
+                etf_close_raw,
+                etf_close_hfq
+            FROM etf_prices
+            WHERE etf_code=%s
+            ORDER BY date
+            """,
             conn, params=(etf_code,),
         )
         sf_row = pd.read_sql(
@@ -222,10 +236,17 @@ def load_from_db(etf_code):
             scaling_factor = float(sf_row['scaling_factor'].iloc[0])
         if df.empty:
             return None, scaling_factor
-        df = df.rename(columns={'date': 'Date', 'combined_close': 'Close'})
+        df = df.rename(columns={
+            'date': 'Date',
+            'combined_close': 'Close',
+            'etf_close_raw': 'ETF_Close_Raw',
+            'etf_close_hfq': 'ETF_Close_HFQ',
+        })
         df['Date']  = pd.to_datetime(df['Date'])
         df['Close'] = df['Close'].astype(float)
-        return df[['Date', 'Close']].reset_index(drop=True), scaling_factor
+        df['ETF_Close_Raw'] = pd.to_numeric(df['ETF_Close_Raw'], errors='coerce')
+        df['ETF_Close_HFQ'] = pd.to_numeric(df['ETF_Close_HFQ'], errors='coerce')
+        return df[['Date', 'Close', 'ETF_Close_Raw', 'ETF_Close_HFQ']].reset_index(drop=True), scaling_factor
     except Exception as e:
         st.warning(f"读取数据异常: {e}")
         return None, 1.0
@@ -284,22 +305,33 @@ def _extract_tickflow_date_close(raw_df):
 
 
 def fetch_all_from_tickflow(etf_code):
-    """拉取 ETF 日线（TickFlow 后复权，对应 adjust=backward）。"""
+    """拉取 ETF 日线，返回不复权与后复权两套价格。"""
     client = get_tickflow_client()
     symbol = _to_tickflow_etf_symbol(etf_code)
-    raw = client.klines.get(
+
+    raw_df = client.klines.get(
+        symbol=symbol,
+        period="1d",
+        count=100000,
+        adjust="none",
+        as_dataframe=True,
+    )
+    hfq_df = client.klines.get(
         symbol=symbol,
         period="1d",
         count=100000,
         adjust="backward",
         as_dataframe=True,
     )
-    out = _extract_tickflow_date_close(raw)
-    return out.rename(columns={"Close": "ETF_Close"})
+
+    raw_out = _extract_tickflow_date_close(raw_df).rename(columns={"Close": "ETF_Close_Raw"})
+    hfq_out = _extract_tickflow_date_close(hfq_df).rename(columns={"Close": "ETF_Close_HFQ"})
+    out = pd.merge(raw_out, hfq_out, on="Date", how="outer").sort_values("Date").reset_index(drop=True)
+    return out
 
 
 def fetch_recent_from_tickflow(etf_code, count=30):
-    """拉取 ETF 近期日线（TickFlow 后复权）。"""
+    """拉取 ETF 近期日线（不复权+后复权）。"""
     df = fetch_all_from_tickflow(etf_code)
     return df.tail(int(count)).reset_index(drop=True)
 
@@ -366,16 +398,16 @@ def _estimate_scaling_factor_from_overlap(index_df, etf_code, default_sf=1.0):
             return float(default_sf)
         merged = pd.merge(
             index_df[["Date", "Index_Close"]],
-            etf_recent[["Date", "ETF_Close"]],
+            etf_recent[["Date", "ETF_Close_Raw"]],
             on="Date",
             how="inner",
         )
         if merged.empty:
             return float(default_sf)
-        merged = merged[(merged["Index_Close"] > 0) & (merged["ETF_Close"] > 0)].copy()
+        merged = merged[(merged["Index_Close"] > 0) & (merged["ETF_Close_Raw"] > 0)].copy()
         if merged.empty:
             return float(default_sf)
-        merged["ratio"] = merged["Index_Close"] / merged["ETF_Close"]
+        merged["ratio"] = merged["Index_Close"] / merged["ETF_Close_Raw"]
         ratio = pd.to_numeric(merged["ratio"], errors="coerce").dropna()
         if ratio.empty:
             return float(default_sf)
@@ -508,13 +540,18 @@ def _sync_data_from_szse_index(etf_code: str, index_code: str):
     meta = _get_target_meta(etf_code)
     sf = _estimate_scaling_factor_from_overlap(hist, etf_code, default_sf=meta["scaling_factor"])
 
+    etf_all = fetch_all_from_tickflow(etf_code)
+    etf_all = _exclude_today_rows(etf_all, date_col="Date")
+    merged = pd.merge(hist, etf_all, on="Date", how="left")
+
     rows = pd.DataFrame({
-        "Date": hist["Date"],
-        "index_close": hist["Index_Close"],
-        "etf_close": None,
-        "combined_close": hist["Index_Close"],
+        "Date": merged["Date"],
+        "index_close": merged["Index_Close"],
+        "etf_close_raw": merged["ETF_Close_Raw"],
+        "etf_close_hfq": merged["ETF_Close_HFQ"],
+        "combined_close": merged["Index_Close"],
     })
-    written_rows = save_prices_to_db(rows[["Date", "index_close", "etf_close", "combined_close"]], etf_code)
+    written_rows = save_prices_to_db(rows[["Date", "index_close", "etf_close_raw", "etf_close_hfq", "combined_close"]], etf_code)
 
     target_name = meta["name"]
     save_target_to_db(
@@ -528,7 +565,7 @@ def _sync_data_from_szse_index(etf_code: str, index_code: str):
 
 
 def _check_needs_full_stitch(etf_code):
-    """检查标的是否需要完整拼接（历史数据 etf_close 全为 NULL 但 index_close 有值）"""
+    """检查标的是否需要完整拼接（历史数据 etf_close_raw 全为 NULL 但 index_close 有值）"""
     conn = get_db_connection()
     if not conn:
         return False
@@ -536,7 +573,7 @@ def _check_needs_full_stitch(etf_code):
         res = pd.read_sql(
             """SELECT 
                 COUNT(CASE WHEN index_close IS NOT NULL THEN 1 END) AS has_index,
-                COUNT(CASE WHEN etf_close IS NOT NULL THEN 1 END) AS has_etf
+                COUNT(CASE WHEN etf_close_raw IS NOT NULL THEN 1 END) AS has_etf_raw
             FROM etf_prices WHERE etf_code=%s""",
             conn, params=(etf_code,),
         )
@@ -544,8 +581,8 @@ def _check_needs_full_stitch(etf_code):
         if res.empty:
             return False
         has_index = res.iloc[0]['has_index'] > 0
-        has_etf = res.iloc[0]['has_etf'] == 0
-        return has_index and has_etf  # 有指数数据但 etf_close 全为 NULL
+        has_etf = res.iloc[0]['has_etf_raw'] == 0
+        return has_index and has_etf  # 有指数数据但 etf_close_raw 全为 NULL
     except Exception:
         return False
 
@@ -584,7 +621,7 @@ def _full_stitch_from_db(etf_code):
         scaling_factor, stitch_date, _ = _estimate_scaling_from_merged(
             merged,
             index_col='index_close_val',
-            etf_col='ETF_Close',
+            etf_col='ETF_Close_Raw',
             default_sf=1.0,
             window=250,
         )
@@ -594,18 +631,18 @@ def _full_stitch_from_db(etf_code):
         # 构造拼接结果：历史段 + 新增段
         hist_part = df_hist.copy()
         hist_part = pd.merge(hist_part, etf_df, on='Date', how='left')
-        hist_part = hist_part.rename(columns={'index_close_val': 'index_close', 'ETF_Close': 'etf_close'})
+        hist_part = hist_part.rename(columns={'index_close_val': 'index_close', 'ETF_Close_Raw': 'etf_close_raw', 'ETF_Close_HFQ': 'etf_close_hfq'})
         hist_part['combined_close'] = hist_part['index_close']
         
         last_hist_date = df_hist['Date'].max()
         new_part = etf_df[etf_df['Date'] > last_hist_date].copy()
-        new_part = new_part.rename(columns={'ETF_Close': 'etf_close'})
+        new_part = new_part.rename(columns={'ETF_Close_Raw': 'etf_close_raw', 'ETF_Close_HFQ': 'etf_close_hfq'})
         new_part['index_close'] = None
-        new_part['combined_close'] = new_part['etf_close'] * scaling_factor
+        new_part['combined_close'] = new_part['etf_close_raw'] * scaling_factor
         
         result = pd.concat(
-            [hist_part[['Date', 'index_close', 'etf_close', 'combined_close']],
-             new_part[['Date', 'index_close', 'etf_close', 'combined_close']]],
+            [hist_part[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'combined_close']],
+             new_part[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'combined_close']]],
             ignore_index=True,
         ).sort_values('Date').reset_index(drop=True)
         
@@ -631,10 +668,10 @@ def _incremental_tickflow_update(etf_code, scaling_factor):
     if patch_data.empty:
         return 0
 
-    patch_data = patch_data.rename(columns={'ETF_Close': 'etf_close'})
+    patch_data = patch_data.rename(columns={'ETF_Close_Raw': 'etf_close_raw', 'ETF_Close_HFQ': 'etf_close_hfq'})
     patch_data['index_close'] = None
-    patch_data['combined_close'] = patch_data['etf_close'] * scaling_factor
-    return int(save_prices_to_db(patch_data[['Date', 'index_close', 'etf_close', 'combined_close']], etf_code))
+    patch_data['combined_close'] = patch_data['etf_close_raw'] * scaling_factor
+    return int(save_prices_to_db(patch_data[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'combined_close']], etf_code))
 
 
 def sync_data_from_tickflow(etf_code: str):
@@ -666,12 +703,13 @@ def sync_data_from_tickflow(etf_code: str):
         rows = pd.DataFrame({
             'Date':           raw['Date'],
             'index_close':    None,
-            'etf_close':      raw['ETF_Close'],
-            'combined_close': raw['ETF_Close'],
+            'etf_close_raw':  raw['ETF_Close_Raw'],
+            'etf_close_hfq':  raw['ETF_Close_HFQ'],
+            'combined_close': raw['ETF_Close_Raw'],
         })
         written_rows = save_prices_to_db(rows, etf_code)
     else:
-        # 检查是否需要完整拼接（历史数据未初始化 etf_close）
+        # 检查是否需要完整拼接（历史数据未初始化 etf_close_raw）
         if _check_needs_full_stitch(etf_code):
             written_rows = _full_stitch_from_db(etf_code)
         else:
@@ -801,16 +839,21 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     else:
         dev_ma = np.nan
 
-    # 展示口径：指数点位 -> ETF价格（TickFlow后复权）
+    # 展示口径：优先使用原生不复权 ETF 收盘；缺失时才使用缩放换算
     def to_etf(point_value):
         if scaling_factor > 0:
             return point_value / scaling_factor
         return point_value
+
+    latest_raw = np.nan
+    if 'ETF_Close_Raw' in df.columns:
+        latest_raw = pd.to_numeric(df['ETF_Close_Raw'].iloc[-1], errors='coerce')
+    latest_etf_price = float(latest_raw) if pd.notna(latest_raw) else to_etf(latest_close)
     
     return fig, {
         "latest_date":  df['Date'].iloc[-1].strftime('%Y-%m-%d'),
         "latest_close": latest_close,
-        "latest_etf_price": to_etf(latest_close),
+        "latest_etf_price": latest_etf_price,
         "trad_pred":    trad_pred,
         "trad_pred_etf": to_etf(trad_pred),
         "roll_pred":    roll_pred,
@@ -1107,7 +1150,7 @@ def stitch_with_tickflow(history_df, etf_code):
     """
     将历史指数数据（history_df: Date, Close=指数点位）与 TickFlow ETF 数据拼接。
     返回 (structured_df, scaling_factor, stitch_date, message)
-    structured_df 列：Date, index_close, etf_close, combined_close
+    structured_df 列：Date, index_close, etf_close_raw, etf_close_hfq, combined_close
     
     注意：本函数用于「已有标的：上传并拼接」流程，需要自动从 TickFlow 拉取数据。
     """
@@ -1120,17 +1163,20 @@ def stitch_with_tickflow(history_df, etf_code):
         # 外连接历史和 TickFlow
         merged = pd.merge(
             history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}),
-            etf_df.rename(columns={'ETF_Close': 'etf_close'}),
+            etf_df,
             on='Date', how='outer',
         ).sort_values('Date')
 
+        merged['etf_close_raw'] = pd.to_numeric(merged['ETF_Close_Raw'], errors='coerce')
+        merged['etf_close_hfq'] = pd.to_numeric(merged['ETF_Close_HFQ'], errors='coerce')
+
         # 使用重叠窗口多点拟合缩放比例，找不到重叠样本才回落到 1.0
-        overlap = merged[merged['index_close'].notna() & merged['etf_close'].notna()]
+        overlap = merged[merged['index_close'].notna() & merged['etf_close_raw'].notna()]
         if not overlap.empty:
             scaling_factor, stitch_date, used_n = _estimate_scaling_from_merged(
                 overlap,
                 index_col='index_close',
-                etf_col='etf_close',
+                etf_col='etf_close_raw',
                 default_sf=1.0,
                 window=250,
             )
@@ -1147,19 +1193,22 @@ def stitch_with_tickflow(history_df, etf_code):
 
         # 历史段：所有历史日期（index_close有值）
         hist = history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}).copy()
-        hist = pd.merge(hist, etf_df.rename(columns={'ETF_Close': 'etf_close'}), on='Date', how='left')
+        hist = pd.merge(hist, etf_df, on='Date', how='left')
+        hist['etf_close_raw'] = pd.to_numeric(hist['ETF_Close_Raw'], errors='coerce')
+        hist['etf_close_hfq'] = pd.to_numeric(hist['ETF_Close_HFQ'], errors='coerce')
         hist['combined_close'] = hist['index_close']
 
         # 近期段：TickFlow 独有日期（晚于历史最新日期）
         last_hist = history_df['Date'].max()
         recent = etf_df[etf_df['Date'] > last_hist].copy()
-        recent = recent.rename(columns={'ETF_Close': 'etf_close'})
+        recent['etf_close_raw'] = pd.to_numeric(recent['ETF_Close_Raw'], errors='coerce')
+        recent['etf_close_hfq'] = pd.to_numeric(recent['ETF_Close_HFQ'], errors='coerce')
         recent['index_close']    = None
-        recent['combined_close'] = recent['etf_close'] * scaling_factor
+        recent['combined_close'] = recent['etf_close_raw'] * scaling_factor
 
         result = pd.concat(
-            [hist[['Date', 'index_close', 'etf_close', 'combined_close']],
-             recent[['Date', 'index_close', 'etf_close', 'combined_close']]],
+            [hist[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'combined_close']],
+             recent[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'combined_close']]],
             ignore_index=True,
         ).sort_values('Date').reset_index(drop=True)
 
@@ -1283,33 +1332,33 @@ with tab1:
                 render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window)
                 plt.close(fig)
 
-                st.caption("ETF价格展示口径：TickFlow后复权")
+                st.caption("ETF价格展示口径：优先原生不复权；缺失时才使用缩放换算")
 
                 st.divider()
                 st.subheader("指数点位 & ETF价格")
                 c1, c2, c3 = st.columns(3)
                 c1.metric("最新日期", res['latest_date'])
                 c2.metric("指数点位", f"{res['latest_close']:,.0f}")
-                c3.metric("ETF价格", f"{res['latest_etf_price']:.4f}")
+                c3.metric("ETF原生不复权", f"{res['latest_etf_price']:.4f}")
 
                 st.subheader("传统回归")
                 c4, c5, c6, c7 = st.columns(4)
                 c4.metric("指数点位", f"{res['trad_pred']:,.0f}")
-                c5.metric("预估价格", f"{res['trad_pred_etf']:.4f}")
+                c5.metric("换算预估价格", f"{res['trad_pred_etf']:.4f}")
                 c6.metric("偏离度", f"{res['dev_trad']:+.2f}%", delta_color="inverse")
                 c7.metric("年化", f"{res['cagr_trad']:.2f}%")
 
                 st.subheader("滚动回归")
                 c8, c9, c10, c11 = st.columns(4)
                 c8.metric("指数点位", f"{res['roll_pred']:,.0f}")
-                c9.metric("预估价格", f"{res['roll_pred_etf']:.4f}")
+                c9.metric("换算预估价格", f"{res['roll_pred_etf']:.4f}")
                 c10.metric("偏离度", f"{res['dev_roll']:+.2f}%", delta_color="inverse")
                 c11.metric("年化", f"{res['cagr_roll']:.2f}%")
 
                 st.subheader(f"MA{ma_window}")
                 c12, c13, c14 = st.columns(3)
                 c12.metric("指数点位", f"{res['ma_pred']:,.0f}" if pd.notna(res['ma_pred']) else "—")
-                c13.metric("预估价格", f"{res['ma_pred_etf']:.4f}" if pd.notna(res['ma_pred_etf']) else "—")
+                c13.metric("换算预估价格", f"{res['ma_pred_etf']:.4f}" if pd.notna(res['ma_pred_etf']) else "—")
                 c14.metric("偏离度", f"{res['dev_ma']:+.2f}%" if pd.notna(res['dev_ma']) else "—", delta_color="inverse")
             except Exception as e:
                 st.error(f"计算出错：{e}")
@@ -1493,10 +1542,11 @@ with tab3:
 
                 if df_new is not None:
                     with st.spinner("正在保存指数历史数据..."):
-                        # 直接保存指数历史，etf_close=NULL，等待更新全部数据时拼接
+                        # 直接保存指数历史，etf_close_raw/etf_close_hfq=NULL，等待更新全部数据时拼接
                         df_to_save = df_new[['Date', 'Close']].copy()
                         df_to_save['index_close']    = df_to_save['Close']
-                        df_to_save['etf_close']      = None
+                        df_to_save['etf_close_raw']  = None
+                        df_to_save['etf_close_hfq']  = None
                         df_to_save['combined_close'] = df_to_save['Close']
                         
                         # 保存元数据和历史数据
@@ -1507,7 +1557,7 @@ with tab3:
                             stitch_date=df_new['Date'].max().date(),
                             index_code=target_index_code,
                         )
-                        written_rows = save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close', 'combined_close']], target_code)
+                        written_rows = save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'combined_close']], target_code)
                         
                         st.session_state["etf_config_runtime"][target_name] = {
                             "name": target_name,
