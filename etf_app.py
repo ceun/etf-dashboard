@@ -1455,7 +1455,7 @@ with tab3:
 
     mode = st.radio(
         "选择操作模式",
-        ["已有标的：上传并拼接", "新增标的：绑定并导入"],
+        ["已有标的：上传并拼接", "新增标的：绑定并导入", "刷新换算系数"],
         horizontal=True,
     )
 
@@ -1508,6 +1508,23 @@ with tab3:
                             st.cache_data.clear()
                             st.success(f"✅ {selected_etf} 已拼接并保存，共 {len(df_combined)} 条")
                             st.caption(f"🗄️ 本次落库 {written_rows} 条")
+
+    elif mode == "刷新换算系数":
+        st.write("**利用数据库中已存的指数和ETF重叠行情，重新计算并更新该标的的换算系数（Scaling Factor）**")
+        if not ACTIVE_ETF_CONFIG:
+            st.info("暂无标的，请先新增标的。")
+        else:
+            refresh_etf = st.selectbox("选择要刷新的标的", list(ACTIVE_ETF_CONFIG.keys()), key="refresh_etf")
+            
+            if st.button("🔄 重新计算并更新", use_container_width=True, type="primary"):
+                etf_code = ACTIVE_ETF_CONFIG[refresh_etf]['etf_code']
+                with st.spinner("正在重新计算换算系数并更新历史价格..."):
+                    success, msg = force_refresh_scaling_factor(etf_code)
+                if success:
+                    st.success(msg)
+                    st.cache_data.clear()  # 清理页面缓存以便图表立即生效
+                else:
+                    st.error(msg)
 
     else:
         st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数代码 + 指数历史文件，四者必填）")
