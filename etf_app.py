@@ -252,14 +252,32 @@ def _extract_tickflow_date_close(raw_df):
     if raw_df is None or raw_df.empty:
         return pd.DataFrame(columns=["Date", "Close"])
 
-    date_col = "date" if "date" in raw_df.columns else ("time" if "time" in raw_df.columns else None)
+    date_col = None
+    if "date" in raw_df.columns:
+        date_col = "date"
+    elif "time" in raw_df.columns:
+        date_col = "time"
+    elif "trade_date" in raw_df.columns:
+        date_col = "trade_date"
+    elif "timestamp" in raw_df.columns:
+        date_col = "timestamp"
+
     close_col = "close" if "close" in raw_df.columns else None
     if date_col is None or close_col is None:
-        raise ValueError(f"TickFlow 返回字段不含 date/close: {list(raw_df.columns)}")
+        raise ValueError(f"TickFlow 返回字段不含可识别日期列或 close 列: {list(raw_df.columns)}")
 
     out = raw_df[[date_col, close_col]].copy()
     out.columns = ["Date", "Close"]
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    if date_col == "timestamp":
+        # TickFlow 日线 timestamp 为毫秒时间戳（UTC基准），转换到北京时间交易日
+        out["Date"] = (
+            pd.to_datetime(out["Date"], unit="ms", utc=True, errors="coerce")
+            .dt.tz_convert("Asia/Shanghai")
+            .dt.tz_localize(None)
+            .dt.normalize()
+        )
+    else:
+        out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.normalize()
     out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
     out = out.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
     return out
@@ -598,6 +616,7 @@ def _full_stitch_from_db(etf_code):
         
         return int(written_rows)
     except Exception as e:
+        st.warning(f"{etf_code} 全量拼接失败: {e}")
         return 0
 
 
