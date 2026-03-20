@@ -6,4 +6,4 @@ psycopg2-binary
 openpyxl
 xlrd
 plotly
-akshare
+tickflow

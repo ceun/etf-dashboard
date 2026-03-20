@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import akshare as ak
+from tickflow.client import TickFlow
 import streamlit as st
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from urllib.request import Request, urlopen
@@ -27,6 +27,7 @@ DEFAULT_ROLLING_WINDOW = 1250
 DATABASE_URL_POOLER = st.secrets.get("database_url_pooler", None)
 DATABASE_URL_DIRECT = st.secrets.get("database_url", None)
 DATABASE_URL = DATABASE_URL_POOLER or DATABASE_URL_DIRECT
+TICKFLOW_API_KEY = st.secrets.get("tickflow_api_key", os.getenv("TICKFLOW_API_KEY"))
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
@@ -232,60 +233,31 @@ def load_from_db(etf_code):
         conn.close()
 
 
-# ─── AkShare ─────────────────────────────────────────────────────────────────
-def _extract_date_close(df):
-    if df is None or df.empty:
-        raise ValueError("返回数据为空")
-
-    date_col = None
-    close_col = None
-    for col in df.columns:
-        col_lower = str(col).lower()
-        if date_col is None and ("时间" in col_lower or "日期" in col_lower or col_lower == "date"):
-            date_col = col
-        if close_col is None and ("收盘" in col_lower or col_lower == "close"):
-            close_col = col
-
-    if date_col is None:
-        date_col = "时间" if "时间" in df.columns else None
-    if close_col is None:
-        close_col = "收盘" if "收盘" in df.columns else None
-
-    if date_col is None or close_col is None:
-        raise ValueError(f"无法识别K线日期/收盘列，当前列: {list(df.columns)}")
-
-    out = df[[date_col, close_col]].copy()
-    out.columns = ["Date", "Close"]
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
-    out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
-    out = out.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
-    if out.empty:
-        raise ValueError("K线清洗后无可用数据")
-    return out
+# ─── TickFlow ────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_tickflow_client():
+    if TICKFLOW_API_KEY:
+        return TickFlow(api_key=TICKFLOW_API_KEY)
+    return TickFlow.free()
 
 
-def _pick_first_existing_column(df, candidates):
-    for col in candidates:
-        if col in df.columns:
-            return col
-    return None
-
-
-def _to_sina_etf_symbol(etf_code):
+def _to_tickflow_etf_symbol(etf_code):
     code = str(etf_code).strip()
     if code.startswith(("5", "6")):
-        return f"sh{code}"
-    return f"sz{code}"
+        return f"{code}.SH"
+    return f"{code}.SZ"
 
 
-def _parse_sina_date_close(df):
-    if df is None or df.empty:
+def _extract_tickflow_date_close(raw_df):
+    if raw_df is None or raw_df.empty:
         return pd.DataFrame(columns=["Date", "Close"])
-    date_col = _pick_first_existing_column(df, ["date", "日期", "Date"])
-    close_col = _pick_first_existing_column(df, ["close", "收盘", "Close"])
+
+    date_col = "date" if "date" in raw_df.columns else ("time" if "time" in raw_df.columns else None)
+    close_col = "close" if "close" in raw_df.columns else None
     if date_col is None or close_col is None:
-        raise ValueError(f"无法识别新浪行情日期/收盘列，当前列: {list(df.columns)}")
-    out = df[[date_col, close_col]].copy()
+        raise ValueError(f"TickFlow 返回字段不含 date/close: {list(raw_df.columns)}")
+
+    out = raw_df[[date_col, close_col]].copy()
     out.columns = ["Date", "Close"]
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
     out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
@@ -293,54 +265,24 @@ def _parse_sina_date_close(df):
     return out
 
 
-def _fetch_etf_hist_eastmoney(etf_code, adjust=""):
-    raw = ak.fund_etf_hist_em(
-        symbol=str(etf_code).strip(),
-        period="daily",
-        start_date="19700101",
-        end_date="20500101",
-        adjust=adjust,
+def fetch_all_from_tickflow(etf_code):
+    """拉取 ETF 日线（TickFlow 后复权，对应 adjust=backward）。"""
+    client = get_tickflow_client()
+    symbol = _to_tickflow_etf_symbol(etf_code)
+    raw = client.klines.get(
+        symbol=symbol,
+        period="1d",
+        count=100000,
+        adjust="backward",
+        as_dataframe=True,
     )
-    return _extract_date_close(raw)
+    out = _extract_tickflow_date_close(raw)
+    return out.rename(columns={"Close": "ETF_Close"})
 
 
-def _fetch_etf_hist_sina(etf_code):
-    raw = ak.fund_etf_hist_sina(symbol=_to_sina_etf_symbol(etf_code))
-    return _parse_sina_date_close(raw)
-
-
-def _fetch_akshare_hist_with_fallback(etf_code, adjust="hfq", allow_sina_fallback=False):
-    errors = []
-
-    try:
-        em_df = _fetch_etf_hist_eastmoney(etf_code, adjust=adjust)
-        if not em_df.empty:
-            return em_df, "eastmoney"
-        errors.append("eastmoney-empty")
-    except Exception as e:
-        errors.append(f"eastmoney:{e}")
-
-    if allow_sina_fallback:
-        try:
-            sina_df = _fetch_etf_hist_sina(etf_code)
-            if not sina_df.empty:
-                return sina_df, "sina"
-            errors.append("sina-empty")
-        except Exception as e:
-            errors.append(f"sina:{e}")
-
-    raise RuntimeError("akshare 历史行情获取失败: " + " | ".join(errors))
-
-
-def fetch_all_from_akshare(etf_code):
-    """拉取 ETF 日线：仅使用东方财富后复权；失败则直接报错。"""
-    df, _ = _fetch_akshare_hist_with_fallback(etf_code, adjust="hfq", allow_sina_fallback=False)
-    return df.rename(columns={"Close": "ETF_Close"})
-
-
-def fetch_recent_from_akshare(etf_code, count=30):
-    """拉取 ETF 近期日线：仅使用东方财富后复权。"""
-    df = fetch_all_from_akshare(etf_code)
+def fetch_recent_from_tickflow(etf_code, count=30):
+    """拉取 ETF 近期日线（TickFlow 后复权）。"""
+    df = fetch_all_from_tickflow(etf_code)
     return df.tail(int(count)).reset_index(drop=True)
 
 
@@ -401,7 +343,7 @@ def fetch_szse_index_daily(index_code, start_date="1991-01-01", end_date="2050-0
 def _estimate_scaling_factor_from_overlap(index_df, etf_code, default_sf=1.0):
     """用最近重叠窗口的中位数比值估算缩放比例，提升 ETF 价格换算稳定性。"""
     try:
-        etf_recent = fetch_recent_from_akshare(etf_code, count=400)
+        etf_recent = fetch_recent_from_tickflow(etf_code, count=400)
         if etf_recent.empty:
             return float(default_sf)
         merged = pd.merge(
@@ -488,129 +430,6 @@ def _delete_today_prices_from_db(etf_code):
         pass
     finally:
         conn.close()
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_recent_ak_hfq_unadj(etf_code, count=30):
-    """返回 AkShare 近期后复权/不复权收盘，列为 Date、HFQ_Close、UNADJ_Close。"""
-    hfq_df, hfq_source = _fetch_akshare_hist_with_fallback(etf_code, adjust="hfq", allow_sina_fallback=False)
-    try:
-        unadj_df, unadj_source = _fetch_akshare_hist_with_fallback(etf_code, adjust="", allow_sina_fallback=False)
-    except Exception:
-        unadj_df, unadj_source = _fetch_akshare_hist_with_fallback(etf_code, adjust="", allow_sina_fallback=True)
-
-    merged = pd.merge(
-        hfq_df.rename(columns={"Close": "HFQ_Close"}),
-        unadj_df.rename(columns={"Close": "UNADJ_Close"}),
-        on="Date",
-        how="inner",
-    ).sort_values("Date").reset_index(drop=True)
-    merged = merged.tail(int(count)).reset_index(drop=True)
-
-    if hfq_source == "eastmoney" and unadj_source == "eastmoney":
-        source_tag = "akshare-eastmoney"
-    elif hfq_source == "eastmoney" and unadj_source == "sina":
-        source_tag = "akshare-eastmoney+sina"
-    else:
-        source_tag = f"akshare-{hfq_source}+{unadj_source}"
-
-    return merged, source_tag
-
-
-def _save_unadj_factor_cache(etf_code, unadj_factor, factor_source):
-    conn = get_db_connection()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO etf_unadj_factor_cache (etf_code, unadj_factor, factor_source, updated_at)
-            VALUES (%s, %s, %s, NOW())
-            ON CONFLICT (etf_code) DO UPDATE SET
-                unadj_factor = EXCLUDED.unadj_factor,
-                factor_source = EXCLUDED.factor_source,
-                updated_at = NOW()
-            """,
-            (str(etf_code).strip(), float(unadj_factor), str(factor_source)),
-        )
-        conn.commit()
-        cur.close()
-    except Exception:
-        pass
-    finally:
-        conn.close()
-
-
-def _load_unadj_factor_cache(etf_code):
-    conn = get_db_connection()
-    if not conn:
-        return None
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT unadj_factor, factor_source
-            FROM etf_unadj_factor_cache
-            WHERE etf_code = %s
-            """,
-            (str(etf_code).strip(),),
-        )
-        row = cur.fetchone()
-        cur.close()
-        if not row:
-            return None
-        factor = pd.to_numeric(row[0], errors='coerce')
-        if pd.isna(factor) or float(factor) <= 0:
-            return None
-        source = str(row[1]).strip() if row[1] else "db-cache"
-        return float(factor), source
-    except Exception:
-        return None
-    finally:
-        conn.close()
-
-
-def get_unadj_factor(etf_code):
-    """
-    使用 AkShare 计算“后复权 -> 不复权”换算系数。
-    策略：优先使用当日因子（仅内存使用，不落盘）；
-    当日不可用时，优先使用昨日已落盘因子；若缓存缺失，再用最新可用历史日因子并落盘。
-    返回 (factor, source_msg)，其中 factor 满足: unadj ~= hfq * factor。
-    """
-    today = _cn_today_date()
-    try:
-        merged, source_tag = fetch_recent_ak_hfq_unadj(etf_code, count=30)
-        if not merged.empty:
-            merged['Date'] = pd.to_datetime(merged['Date'])
-            merged = merged[(merged['HFQ_Close'] > 0) & (merged['UNADJ_Close'] > 0)].copy()
-            if not merged.empty:
-                merged['factor'] = merged['UNADJ_Close'] / merged['HFQ_Close']
-
-                today_rows = merged[merged['Date'].dt.date == today]
-                prev_rows = merged[merged['Date'].dt.date < today]
-
-                if not prev_rows.empty:
-                    yrow = prev_rows.sort_values('Date').iloc[-1]
-                    yfactor = float(yrow['factor'])
-                    if yfactor > 0:
-                        ydate = yrow['Date'].strftime('%Y-%m-%d')
-                        _save_unadj_factor_cache(etf_code, yfactor, f"{source_tag}-yday:{ydate}")
-
-                if not today_rows.empty:
-                    trow = today_rows.sort_values('Date').iloc[-1]
-                    tfactor = float(trow['factor'])
-                    if tfactor > 0:
-                        return tfactor, f'{source_tag}-today-not-saved'
-    except Exception:
-        pass
-
-    cached = _load_unadj_factor_cache(etf_code)
-    if cached is not None:
-        cached_factor, cached_source = cached
-        return float(cached_factor), f"db-yesterday:{cached_source}"
-
-    return 1.0, 'default-1.0'
 
 
 def _get_target_name(etf_code, default_name=None):
@@ -714,7 +533,7 @@ def _check_needs_full_stitch(etf_code):
 
 
 def _full_stitch_from_db(etf_code):
-    """完整拼接：从 DB 读取 index_close 数据，拉取 AkShare 全量，计算 scaling_factor 并更新所有行"""
+    """完整拼接：从 DB 读取 index_close 数据，拉取 ETF 全量，计算 scaling_factor 并更新所有行"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -733,8 +552,8 @@ def _full_stitch_from_db(etf_code):
         df_hist['Date'] = pd.to_datetime(df_hist['date'])
         df_hist = df_hist.rename(columns={'index_close': 'index_close_val'})[['Date', 'index_close_val']]
         
-        # 拉取 AkShare 完整历史
-        etf_df = fetch_all_from_akshare(etf_code)
+        # 拉取 ETF 完整历史
+        etf_df = fetch_all_from_tickflow(etf_code)
         etf_df = _exclude_today_rows(etf_df, date_col='Date')
         if etf_df.empty:
             return False
@@ -782,9 +601,9 @@ def _full_stitch_from_db(etf_code):
         return 0
 
 
-def _incremental_akshare_update(etf_code, scaling_factor):
+def _incremental_tickflow_update(etf_code, scaling_factor):
     """增量刷新：每次覆盖最近三个交易日，且当日数据不落盘。"""
-    recent_all = fetch_recent_from_akshare(etf_code, count=30)
+    recent_all = fetch_recent_from_tickflow(etf_code, count=30)
     recent_all = _exclude_today_rows(recent_all, date_col='Date')
     if recent_all.empty:
         return 0
@@ -799,7 +618,7 @@ def _incremental_akshare_update(etf_code, scaling_factor):
     return int(save_prices_to_db(patch_data[['Date', 'index_close', 'etf_close', 'combined_close']], etf_code))
 
 
-def sync_data_from_akshare(etf_code: str):
+def sync_data_from_tickflow(etf_code: str):
     """
     仅在手动点击「更新全部数据」时调用：
     若配置深证指数代码则优先直连深证接口；否则走 ETF 拼接/回补链路。
@@ -818,7 +637,7 @@ def sync_data_from_akshare(etf_code: str):
     df, scaling_factor = load_from_db(etf_code)
     written_rows = 0
     if df is None:
-        raw = fetch_all_from_akshare(etf_code)
+        raw = fetch_all_from_tickflow(etf_code)
         raw = _exclude_today_rows(raw, date_col='Date')
         if raw.empty:
             df_latest, scaling_factor_latest = load_from_db(etf_code)
@@ -837,7 +656,7 @@ def sync_data_from_akshare(etf_code: str):
         if _check_needs_full_stitch(etf_code):
             written_rows = _full_stitch_from_db(etf_code)
         else:
-            written_rows = _incremental_akshare_update(etf_code, scaling_factor)
+            written_rows = _incremental_tickflow_update(etf_code, scaling_factor)
 
     df_latest, scaling_factor_latest = load_from_db(etf_code)
     return df_latest, scaling_factor_latest, int(written_rows)
@@ -846,14 +665,14 @@ def sync_data_from_akshare(etf_code: str):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_data(etf_code: str):
     """
-    页面加载只读数据库，不触发任何 AkShare 网络请求。
+    页面加载只读数据库，不触发任何网络请求。
     实时更新请点击侧边栏「更新全部数据」。
     """
     return load_from_db(etf_code)
 
 
 # ─── 核心分析 ─────────────────────────────────────────────────────────────────
-def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window=1250, ma_window=250, scaling_factor=1.0, unadj_factor=1.0):
+def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window=1250, ma_window=250, scaling_factor=1.0):
     df = df.copy()
     df['Log_Close'] = np.log(df['Close'])
     df['Time_Idx']  = np.arange(len(df))
@@ -963,29 +782,28 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     else:
         dev_ma = np.nan
 
-    # 展示口径：指数点位 -> 后复权ETF -> 不复权ETF
-    def to_unadj_etf(point_value):
+    # 展示口径：指数点位 -> ETF价格（TickFlow后复权）
+    def to_etf(point_value):
         if scaling_factor > 0:
-            return point_value / scaling_factor * unadj_factor
+            return point_value / scaling_factor
         return point_value
     
     return fig, {
         "latest_date":  df['Date'].iloc[-1].strftime('%Y-%m-%d'),
         "latest_close": latest_close,
-        "latest_etf_price": to_unadj_etf(latest_close),
+        "latest_etf_price": to_etf(latest_close),
         "trad_pred":    trad_pred,
-        "trad_pred_etf": to_unadj_etf(trad_pred),
+        "trad_pred_etf": to_etf(trad_pred),
         "roll_pred":    roll_pred,
-        "roll_pred_etf": to_unadj_etf(roll_pred),
+        "roll_pred_etf": to_etf(roll_pred),
         "ma_pred":   ma_pred,
-        "ma_pred_etf": to_unadj_etf(ma_pred) if pd.notna(ma_pred) else np.nan,
+        "ma_pred_etf": to_etf(ma_pred) if pd.notna(ma_pred) else np.nan,
         "dev_trad":     (latest_close / trad_pred - 1) * 100,
         "dev_roll":     (latest_close / roll_pred - 1) * 100,
         "dev_ma":       dev_ma,
         "cagr_trad":    (np.exp(k_trad * 252) - 1) * 100,
         "cagr_roll":    (np.exp(k_roll_last * 252) - 1) * 100,
         "scaling_factor": scaling_factor,
-        "unadj_factor": unadj_factor,
         "z_plus": z_plus,
         "z_minus": z_minus,
         "std_trad": std_trad,
@@ -1266,21 +1084,21 @@ def parse_upload_file(uploaded_file):
         return None, f"❌ 解析文件出错: {e}"
 
 
-def stitch_with_akshare(history_df, etf_code):
+def stitch_with_tickflow(history_df, etf_code):
     """
-    将历史指数数据（history_df: Date, Close=指数点位）与 AkShare ETF 数据拼接。
+    将历史指数数据（history_df: Date, Close=指数点位）与 TickFlow ETF 数据拼接。
     返回 (structured_df, scaling_factor, stitch_date, message)
     structured_df 列：Date, index_close, etf_close, combined_close
     
-    注意：本函数用于「已有标的：上传并拼接」流程，需要自动从 AkShare 拉取数据。
+    注意：本函数用于「已有标的：上传并拼接」流程，需要自动从 TickFlow 拉取数据。
     """
     try:
-        etf_df = fetch_all_from_akshare(etf_code)
+        etf_df = fetch_all_from_tickflow(etf_code)
         etf_df = _exclude_today_rows(etf_df, date_col='Date')
         if etf_df.empty:
-            return None, 1.0, None, "❌ AkShare暂无可落盘的历史日线（当日数据不会落盘）"
+            return None, 1.0, None, "❌ TickFlow暂无可落盘的历史日线（当日数据不会落盘）"
 
-        # 外连接历史和 AkShare
+        # 外连接历史和 TickFlow
         merged = pd.merge(
             history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}),
             etf_df.rename(columns={'ETF_Close': 'etf_close'}),
@@ -1306,14 +1124,14 @@ def stitch_with_akshare(history_df, etf_code):
         else:
             scaling_factor = 1.0
             stitch_date    = history_df['Date'].max().date()
-            msg_prefix = "⚠️ 历史数据与 AkShare 无重叠日期，缩放比例暂设为 1.0"
+            msg_prefix = "⚠️ 历史数据与 TickFlow 无重叠日期，缩放比例暂设为 1.0"
 
         # 历史段：所有历史日期（index_close有值）
         hist = history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}).copy()
         hist = pd.merge(hist, etf_df.rename(columns={'ETF_Close': 'etf_close'}), on='Date', how='left')
         hist['combined_close'] = hist['index_close']
 
-        # 近期段：AkShare 独有日期（晚于历史最新日期）
+        # 近期段：TickFlow 独有日期（晚于历史最新日期）
         last_hist = history_df['Date'].max()
         recent = etf_df[etf_df['Date'] > last_hist].copy()
         recent = recent.rename(columns={'ETF_Close': 'etf_close'})
@@ -1384,11 +1202,10 @@ with st.sidebar:
         st.cache_data.clear()
         prog = st.progress(0)
         etf_list = list(ACTIVE_ETF_CONFIG.items())
-        factor_source_records = []
         for idx, (name, cfg) in enumerate(etf_list):
             with st.spinner(f"拉取 {name}..."):
                 try:
-                    _, _, written_rows = sync_data_from_akshare(cfg['etf_code'])
+                    _, _, written_rows = sync_data_from_tickflow(cfg['etf_code'])
                     if written_rows > 0:
                         st.caption(f"🗄️ {name} 本次落库 {written_rows} 条")
                     else:
@@ -1397,20 +1214,7 @@ with st.sidebar:
                     st.warning(f"{name} 失败: {e}")
                     prog.progress((idx + 1) / len(etf_list))
                     continue
-
-                try:
-                    _, factor_source = get_unadj_factor(cfg['etf_code'])
-                    factor_source_records.append((name, factor_source))
-                except Exception as e:
-                    st.warning(f"{name} 因子刷新失败: {e}")
             prog.progress((idx + 1) / len(etf_list))
-
-        if factor_source_records:
-            source_counts = {}
-            for _, src in factor_source_records:
-                source_counts[src] = source_counts.get(src, 0) + 1
-            summary = "；".join([f"{src}: {cnt}" for src, cnt in source_counts.items()])
-            st.caption(f"本次复权因子刷新来源统计：{summary}")
 
         st.success("✅ 全部数据已更新！")
         st.rerun()
@@ -1456,12 +1260,11 @@ with tab1:
             st.error("数据不足，无法计算回归，请先在「数据管理」中上传历史指数文件并拼接。")
         else:
             try:
-                unadj_factor, factor_source = get_unadj_factor(etf_code)
-                fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor, unadj_factor)
+                fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor)
                 render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window)
                 plt.close(fig)
 
-                st.caption(f"ETF价格展示口径：不复权（因子来源: {factor_source}）")
+                st.caption("ETF价格展示口径：TickFlow后复权")
 
                 st.divider()
                 st.subheader("指数点位 & ETF价格")
@@ -1620,7 +1423,7 @@ with tab3:
                     else:
                         etf_code = ACTIVE_ETF_CONFIG[selected_etf]['etf_code']
                         with st.spinner("正在拼接并保存..."):
-                            df_combined, scaling_factor, stitch_date, msg = stitch_with_akshare(df_uploaded, etf_code)
+                            df_combined, scaling_factor, stitch_date, msg = stitch_with_tickflow(df_uploaded, etf_code)
                             
                         st.info(msg)
 
