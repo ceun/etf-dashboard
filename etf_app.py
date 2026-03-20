@@ -1218,6 +1218,42 @@ def stitch_with_tickflow(history_df, etf_code):
         return None, 1.0, None, f"❌ 拼接失败: {e}"
 
 
+def force_refresh_scaling_factor(etf_code):
+    """手动触发：从数据库读取已有重叠数据，重新拟合 scaling_factor 并更新库表"""
+    conn = get_db_connection()
+    if not conn:
+        return False, "数据库连接失败"
+    try:
+        df = pd.read_sql(
+            "SELECT date AS \"Date\", index_close, etf_close_raw FROM etf_prices WHERE etf_code=%s",
+            conn, params=(etf_code,)
+        )
+        if df.empty:
+            return False, "数据库无该标的行情数据"
+        
+        # 利用数据库中已有行情进行 250 天中位数拟合
+        sf, stitch_date, used_n = _estimate_scaling_from_merged(
+            df, index_col='index_close', etf_col='etf_close_raw', default_sf=1.0, window=250
+        )
+        if used_n == 0:
+            return False, "未找到有效的历史指数与ETF重叠数据，无法计算"
+            
+        cur = conn.cursor()
+        # 更新元数据表里的系数
+        cur.execute("UPDATE etf_targets SET scaling_factor=%s, stitch_date=%s WHERE etf_code=%s", (sf, stitch_date, etf_code))
+        # 用新系数重新换算 ETF独有时间段 的合成收盘价 (index_close为空的部分)
+        cur.execute("""
+            UPDATE etf_prices SET combined_close = etf_close_raw * %s 
+            WHERE etf_code=%s AND index_close IS NULL AND etf_close_raw IS NOT NULL
+        """, (sf, etf_code))
+        conn.commit()
+        return True, f"成功刷新！最新换算系数为: {sf:.4f} (基于 {used_n} 天重叠数据)"
+    except Exception as e:
+        return False, f"刷新失败: {e}"
+    finally:
+        conn.close()
+
+
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
 st.title("📈 今天买什么")
 
