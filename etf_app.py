@@ -686,9 +686,12 @@ def sync_data_from_tickflow(etf_code: str):
     index_code = _normalize_index_code(meta.get("index_code"))
 
     if _is_szse_index_code(index_code):
-        written_rows = _sync_data_from_szse_index(etf_code, index_code)
-        df_latest, scaling_factor_latest = load_from_db(etf_code)
-        return df_latest, scaling_factor_latest, int(written_rows)
+        try:
+            written_rows = _sync_data_from_szse_index(etf_code, index_code)
+            df_latest, scaling_factor_latest = load_from_db(etf_code)
+            return df_latest, scaling_factor_latest, int(written_rows)
+        except Exception as e:
+            st.warning(f"深证接口直连 {index_code} 失败 ({e})，将自动走 ETF 拟合兜底方案。")
 
     _delete_today_prices_from_db(etf_code)
 
