@@ -411,7 +411,8 @@ def _estimate_scaling_factor_from_overlap(index_df, etf_code, default_sf=1.0):
         ratio = pd.to_numeric(merged["ratio"], errors="coerce").dropna()
         if ratio.empty:
             return float(default_sf)
-        sf = float(ratio.tail(250).median())
+        # 采用最后一天重叠的精确比值，彻底消除拼接日的“跳空缺口”
+        sf = float(ratio.iloc[-1])
         return sf if sf > 0 else float(default_sf)
     except Exception:
         return float(default_sf)
@@ -435,7 +436,8 @@ def _estimate_scaling_from_merged(merged_df, index_col, etf_col, default_sf=1.0,
     if ratio.empty:
         return float(default_sf), None, 0
 
-    sf = float(ratio.median())
+    # 采用最后一天重叠的精确比值，保证后续涨跌幅与ETF完全一致
+    sf = float(ratio.iloc[-1])
     if sf <= 0:
         return float(default_sf), None, 0
     stitch_date = sample["Date"].max().date() if "Date" in sample.columns else None
