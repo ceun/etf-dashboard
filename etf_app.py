@@ -344,7 +344,7 @@ def _normalize_index_code(index_code):
 
 def _is_szse_index_code(index_code):
     code = _normalize_index_code(index_code)
-    return code.startswith("CN") or code.startswith("399")
+    return code.startswith(("CN", "399", "48"))
 
 
 def _http_get_json(url, timeout=12):
