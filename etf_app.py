@@ -737,7 +737,8 @@ def get_data(etf_code: str):
 def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window=1250, ma_window=250, scaling_factor=1.0):
     df = df.copy()
     df['Log_Close'] = np.log(df['Close'])
-    df['Time_Idx']  = np.arange(len(df))
+    # 计算物理时间差（自然年），代替固定的行号索引
+    df['Years_Passed'] = (df['Date'] - df['Date'].iloc[0]).dt.days / 365.25
     tradition_start_dt = pd.to_datetime(tradition_start)
     tradition_end_dt = pd.to_datetime(tradition_end)
 
@@ -747,10 +748,10 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     sample_df = df[mask]
     if len(sample_df) < 100:
         raise ValueError(f"传统回归样本不足（{len(sample_df)} 条），请检查数据起止日期")
-    k_trad, b_trad = np.polyfit(sample_df['Time_Idx'], sample_df['Log_Close'], 1)
-    df['Trad_Pred_Log']   = k_trad * df['Time_Idx'] + b_trad
+    k_trad, b_trad = np.polyfit(sample_df['Years_Passed'], sample_df['Log_Close'], 1)
+    df['Trad_Pred_Log']   = k_trad * df['Years_Passed'] + b_trad
     df['Trad_Pred_Price'] = np.exp(df['Trad_Pred_Log'])
-    resids_trad = sample_df['Log_Close'] - (k_trad * sample_df['Time_Idx'] + b_trad)
+    resids_trad = sample_df['Log_Close'] - (k_trad * sample_df['Years_Passed'] + b_trad)
     std_trad    = np.std(resids_trad)
     df['Trad_Z_Score'] = (df['Log_Close'] - df['Trad_Pred_Log']) / std_trad
     z_plus  = np.log(1 + deviation_pct / 100.0) / std_trad
@@ -762,9 +763,9 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     k_roll_last   = np.nan
     for i in range(rolling_window, len(df)):
         ys = df['Log_Close'].values[i - rolling_window:i]
-        xs = np.arange(rolling_window)
+        xs = df['Years_Passed'].values[i - rolling_window:i]
         k_r, b_r = np.polyfit(xs, ys, 1)
-        pred = k_r * (rolling_window - 1) + b_r
+        pred = k_r * xs[-1] + b_r
         rolling_preds[i] = pred
         std_r = np.std(ys - (k_r * xs + b_r))
         if std_r > 0:
@@ -868,8 +869,8 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
         "dev_trad":     (latest_close / trad_pred - 1) * 100,
         "dev_roll":     (latest_close / roll_pred - 1) * 100,
         "dev_ma":       dev_ma,
-        "cagr_trad":    (np.exp(k_trad * 252) - 1) * 100,
-        "cagr_roll":    (np.exp(k_roll_last * 252) - 1) * 100,
+        "cagr_trad":    (np.exp(k_trad) - 1) * 100,
+        "cagr_roll":    (np.exp(k_roll_last) - 1) * 100,
         "scaling_factor": scaling_factor,
         "z_plus": z_plus,
         "z_minus": z_minus,
