@@ -11,6 +11,7 @@ import matplotlib.dates as mdates
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from tickflow.client import TickFlow
+import yfinance as yf
 import streamlit as st
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from urllib.request import Request, urlopen
@@ -88,13 +89,13 @@ def get_db_connection():
 
 # ─── 标的元数据 ───────────────────────────────────────────────────────────────
 def load_targets_from_db():
-    """从 etf_targets 读取所有标的，返回 {name: {etf_code, name, index_code, scaling_factor}}"""
+    """从 etf_targets 读取所有标的，返回 {name: {etf_code, name, index_code, scaling_factor, data_source}}"""
     conn = get_db_connection()
     if not conn:
         return {}
     try:
         df = pd.read_sql(
-            "SELECT etf_code, name, index_code, scaling_factor FROM etf_targets ORDER BY name",
+            "SELECT etf_code, name, index_code, scaling_factor, data_source FROM etf_targets ORDER BY name",
             conn,
         )
         if df.empty:
@@ -105,6 +106,7 @@ def load_targets_from_db():
                 "etf_code": str(row['etf_code']),
                 "index_code": str(row['index_code']).strip() if pd.notna(row['index_code']) else "",
                 "scaling_factor": float(row['scaling_factor']) if pd.notna(row['scaling_factor']) else 1.0,
+                "data_source": _normalize_data_source(row['data_source']) if pd.notna(row['data_source']) else _infer_data_source_from_index_code(row['index_code']),
             }
             for _, row in df.iterrows()
         }
@@ -115,22 +117,24 @@ def load_targets_from_db():
         conn.close()
 
 
-def save_target_to_db(etf_code, name, scaling_factor=None, stitch_date=None, index_code=None):
+def save_target_to_db(etf_code, name, scaling_factor=None, stitch_date=None, index_code=None, data_source=None):
     """新增或更新 etf_targets 标的元数据"""
     conn = get_db_connection()
     if not conn:
         return False
     try:
         cur = conn.cursor()
+        normalized_source = _normalize_data_source(data_source) if data_source else _infer_data_source_from_index_code(index_code)
         cur.execute("""
-            INSERT INTO etf_targets (etf_code, name, index_code, scaling_factor, stitch_date)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO etf_targets (etf_code, name, index_code, scaling_factor, stitch_date, data_source)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (etf_code) DO UPDATE SET
                 name           = EXCLUDED.name,
                 index_code     = COALESCE(EXCLUDED.index_code,     etf_targets.index_code),
                 scaling_factor = COALESCE(EXCLUDED.scaling_factor, etf_targets.scaling_factor),
-                stitch_date    = COALESCE(EXCLUDED.stitch_date,    etf_targets.stitch_date)
-        """, (etf_code, name, index_code, scaling_factor, stitch_date))
+                stitch_date    = COALESCE(EXCLUDED.stitch_date,    etf_targets.stitch_date),
+                data_source    = COALESCE(EXCLUDED.data_source,    etf_targets.data_source)
+        """, (etf_code, name, index_code, scaling_factor, stitch_date, normalized_source))
         conn.commit()
         cur.close()
         return True
@@ -342,6 +346,22 @@ def _normalize_index_code(index_code):
     return str(index_code).strip().upper()
 
 
+def _normalize_data_source(data_source):
+    if data_source is None:
+        return ""
+    code = str(data_source).strip().upper()
+    if code in {"SZ", "ZZ", "YH"}:
+        return code
+    return ""
+
+
+def _infer_data_source_from_index_code(index_code):
+    code = _normalize_index_code(index_code)
+    if _is_szse_index_code(code):
+        return "SZ"
+    return "ZZ"
+
+
 def _is_szse_index_code(index_code):
     code = _normalize_index_code(index_code)
     return code.startswith(("CN", "399", "48"))
@@ -388,6 +408,38 @@ def fetch_szse_index_daily(index_code, start_date="1991-01-01", end_date="2050-0
 
     out = pd.DataFrame(parsed, columns=["Date", "Index_Close"]).dropna()
     return out.sort_values("Date").reset_index(drop=True)
+
+
+def fetch_yahoo_history(symbol, start_date="1991-01-01", end_date=None):
+    """从 Yahoo Finance 拉取历史日线（Date, Index_Close）。"""
+    code = str(symbol or "").strip()
+    if not code:
+        return pd.DataFrame(columns=["Date", "Index_Close"])
+
+    hist = yf.download(
+        code,
+        start=str(start_date),
+        end=str(end_date) if end_date else None,
+        auto_adjust=False,
+        progress=False,
+        actions=False,
+    )
+    if hist is None or hist.empty:
+        return pd.DataFrame(columns=["Date", "Index_Close"])
+
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = [col[0] for col in hist.columns]
+
+    hist = hist.reset_index()
+    if "Date" not in hist.columns or "Close" not in hist.columns:
+        raise ValueError(f"Yahoo Finance 返回字段不含 Date/Close: {list(hist.columns)}")
+
+    out = hist[["Date", "Close"]].copy()
+    out = out.rename(columns={"Close": "Index_Close"})
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.normalize()
+    out["Index_Close"] = pd.to_numeric(out["Index_Close"], errors="coerce")
+    out = out.dropna(subset=["Date", "Index_Close"]).sort_values("Date").reset_index(drop=True)
+    return out
 
 
 def _estimate_scaling_factor_from_overlap(index_df, etf_code, default_sf=1.0):
@@ -503,18 +555,19 @@ def _get_target_name(etf_code, default_name=None):
 
 
 def _get_target_meta(etf_code, default_name=None):
-    """读取标的元数据，返回 dict(name, index_code, scaling_factor)。"""
+    """读取标的元数据，返回 dict(name, index_code, scaling_factor, data_source)。"""
     conn = get_db_connection()
     fallback = {
         "name": default_name or etf_code,
         "index_code": "",
         "scaling_factor": 1.0,
+        "data_source": "ZZ",
     }
     if not conn:
         return fallback
     try:
         res = pd.read_sql(
-            "SELECT name, index_code, scaling_factor FROM etf_targets WHERE etf_code=%s",
+            "SELECT name, index_code, scaling_factor, data_source FROM etf_targets WHERE etf_code=%s",
             conn,
             params=(etf_code,),
         )
@@ -526,6 +579,7 @@ def _get_target_meta(etf_code, default_name=None):
             "name": row["name"] if pd.notna(row["name"]) else fallback["name"],
             "index_code": _normalize_index_code(row["index_code"]) if pd.notna(row["index_code"]) else "",
             "scaling_factor": float(row["scaling_factor"]) if pd.notna(row["scaling_factor"]) else 1.0,
+            "data_source": _normalize_data_source(row["data_source"]) if pd.notna(row["data_source"]) else _infer_data_source_from_index_code(row["index_code"]),
         }
     except Exception:
         return fallback
@@ -562,6 +616,43 @@ def _sync_data_from_szse_index(etf_code: str, index_code: str):
         index_code=index_code,
         scaling_factor=sf,
         stitch_date=hist["Date"].max().date(),
+        data_source="SZ",
+    )
+    return int(written_rows)
+
+
+def _sync_data_from_yahoo(etf_code: str, yahoo_symbol: str):
+    """Yahoo Finance 直连同步：指数点位直接入库，并附带 ETF 行情用于展示换算。"""
+    _delete_today_prices_from_db(etf_code)
+    hist = fetch_yahoo_history(yahoo_symbol, start_date="1991-01-01")
+    hist = _exclude_today_rows(hist, date_col="Date")
+    if hist.empty:
+        raise RuntimeError(f"Yahoo Finance 无可落盘数据: {yahoo_symbol}")
+
+    meta = _get_target_meta(etf_code)
+    sf = _estimate_scaling_factor_from_overlap(hist, etf_code, default_sf=meta["scaling_factor"])
+
+    etf_all = fetch_all_from_tickflow(etf_code)
+    etf_all = _exclude_today_rows(etf_all, date_col="Date")
+    merged = pd.merge(hist, etf_all, on="Date", how="left")
+
+    rows = pd.DataFrame({
+        "Date": merged["Date"],
+        "index_close": merged["Index_Close"],
+        "etf_close_raw": merged["ETF_Close_Raw"],
+        "etf_close_hfq": merged["ETF_Close_HFQ"],
+        "combined_close": merged["Index_Close"],
+    })
+    written_rows = save_prices_to_db(rows[["Date", "index_close", "etf_close_raw", "etf_close_hfq", "combined_close"]], etf_code)
+
+    target_name = meta["name"]
+    save_target_to_db(
+        etf_code,
+        target_name,
+        index_code=yahoo_symbol,
+        scaling_factor=sf,
+        stitch_date=hist["Date"].max().date(),
+        data_source="YH",
     )
     return int(written_rows)
 
@@ -650,9 +741,17 @@ def _full_stitch_from_db(etf_code):
         
         # 更新 DB
         written_rows = save_prices_to_db(result, etf_code)
-        target_name = _get_target_name(etf_code)
-        save_target_to_db(etf_code, target_name, scaling_factor=scaling_factor, stitch_date=stitch_date)
-        
+        meta = _get_target_meta(etf_code)
+        target_name = meta["name"]
+        save_target_to_db(
+            etf_code,
+            target_name,
+            scaling_factor=scaling_factor,
+            stitch_date=stitch_date,
+            index_code=meta.get("index_code") or None,
+            data_source=meta.get("data_source") or "ZZ",
+        )
+
         return int(written_rows)
     except Exception as e:
         st.warning(f"{etf_code} 全量拼接失败: {e}")
@@ -684,14 +783,19 @@ def sync_data_from_tickflow(etf_code: str):
     """
     meta = _get_target_meta(etf_code)
     index_code = _normalize_index_code(meta.get("index_code"))
+    data_source = _normalize_data_source(meta.get("data_source")) or _infer_data_source_from_index_code(index_code)
 
-    if _is_szse_index_code(index_code):
+    if data_source == "SZ":
         try:
             written_rows = _sync_data_from_szse_index(etf_code, index_code)
             df_latest, scaling_factor_latest = load_from_db(etf_code)
             return df_latest, scaling_factor_latest, int(written_rows)
         except Exception as e:
             st.warning(f"深证接口直连 {index_code} 失败 ({e})，将自动走 ETF 拟合兜底方案。")
+    elif data_source == "YH":
+        written_rows = _sync_data_from_yahoo(etf_code, index_code)
+        df_latest, scaling_factor_latest = load_from_db(etf_code)
+        return df_latest, scaling_factor_latest, int(written_rows)
 
     _delete_today_prices_from_db(etf_code)
 
@@ -704,7 +808,13 @@ def sync_data_from_tickflow(etf_code: str):
             df_latest, scaling_factor_latest = load_from_db(etf_code)
             return df_latest, scaling_factor_latest, 0
         target_name = _get_target_name(etf_code)
-        save_target_to_db(etf_code, target_name, scaling_factor=1.0, index_code=index_code or None)
+        save_target_to_db(
+            etf_code,
+            target_name,
+            scaling_factor=1.0,
+            index_code=index_code or None,
+            data_source=data_source or "ZZ",
+        )
         rows = pd.DataFrame({
             'Date':           raw['Date'],
             'index_close':    None,
@@ -1509,6 +1619,7 @@ with tab3:
                                 scaling_factor=scaling_factor,
                                 stitch_date=stitch_date,
                                 index_code=(ACTIVE_ETF_CONFIG[selected_etf].get("index_code") or None),
+                                data_source=(ACTIVE_ETF_CONFIG[selected_etf].get("data_source") or "ZZ"),
                             )
                             written_rows = save_prices_to_db(df_combined, etf_code)
                             st.session_state["etf_config_runtime"][selected_etf]['scaling_factor'] = scaling_factor
@@ -1517,37 +1628,66 @@ with tab3:
                             st.caption(f"🗄️ 本次落库 {written_rows} 条")
 
     else:
-        st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数代码 + 指数历史文件，四者必填）")
-        st.caption("说明：若指数代码为深证体系（如 CN2324/399xxx），更新时优先走深证接口直连；其他指数走 ETF 拟合。")
+        st.subheader("➕ 新增标的（标的名称 + ETF代码 + 指数代码/符号；ZZ 需历史文件，SZ/YH 可直连）")
+        st.caption("说明：`SZ` 走深证接口，`ZZ` 走 ETF 拼接，`YH` 走 Yahoo Finance。")
 
-        col_name, col_code, col_index = st.columns(3)
+        col_name, col_code, col_index, col_source = st.columns(4)
         with col_name:
             new_etf_name = st.text_input("标的名称", placeholder="例如：新etf指数")
         with col_code:
             new_etf_code = st.text_input("关联 ETF 代码", placeholder="例如：159999")
         with col_index:
-            new_index_code = st.text_input("指数代码", placeholder="例如：CN2324 或 000922")
+            new_index_code = st.text_input("指数代码/符号", placeholder="SZ/ZZ 例如：CN2324；YH 例如：^GSPC")
+        with col_source:
+            new_data_source = st.selectbox("数据源", ["ZZ", "SZ", "YH"], index=0)
 
-        new_history_file = st.file_uploader(
-            "上传该标的的指数历史文件（xlsx/xls/csv）",
-            type=['xlsx', 'xls', 'csv'],
-            key="new_target_history_file",
-        )
+        new_history_file = None
+        if new_data_source == "ZZ":
+            new_history_file = st.file_uploader(
+                "上传该标的的指数历史文件（xlsx/xls/csv）",
+                type=['xlsx', 'xls', 'csv'],
+                key="new_target_history_file",
+            )
+        elif new_data_source == "YH":
+            st.info("YH 模式会直接从 Yahoo Finance 拉取全量历史数据并保存，无需上传历史文件。")
+        else:
+            st.info("SZ 模式更新时会从深证接口全量拉取数据，无需上传历史文件。")
 
         if st.button("➕ 绑定并导入", use_container_width=True, type="primary"):
             target_name = (new_etf_name or "").strip()
             target_code = (new_etf_code or "").strip()
             target_index_code = _normalize_index_code((new_index_code or "").strip())
+            target_data_source = _normalize_data_source(new_data_source) or "ZZ"
 
-            if not target_name or not target_code or not target_index_code or new_history_file is None:
-                st.error("❌ 必须同时提供：标的名称、ETF代码、指数代码、指数历史文件")
+            needs_file = target_data_source == "ZZ"
+            if not target_name or not target_code or not target_index_code or (needs_file and new_history_file is None):
+                st.error("❌ 必须提供：标的名称、ETF代码、指数代码；若数据源为 ZZ 还需上传指数历史文件")
             elif target_name in ACTIVE_ETF_CONFIG:
                 st.error(f"❌ 标的 {target_name} 已存在，请更换名称")
             else:
-                df_new, parse_msg = parse_upload_file(new_history_file)
-                st.info(parse_msg)
+                if target_data_source == "ZZ":
+                    df_new, parse_msg = parse_upload_file(new_history_file)
+                    st.info(parse_msg)
+                elif target_data_source == "YH":
+                    try:
+                        df_hist = fetch_yahoo_history(target_index_code, start_date="1991-01-01")
+                        df_hist = _exclude_today_rows(df_hist, date_col="Date")
+                        df_new = df_hist.rename(columns={"Index_Close": "Close"})
+                        parse_msg = f"✅ 已从 Yahoo Finance 拉取 {len(df_new)} 条数据"
+                    except Exception as e:
+                        df_new, parse_msg = None, f"❌ Yahoo Finance 拉取失败: {e}"
+                    st.info(parse_msg)
+                else:
+                    try:
+                        df_hist = fetch_szse_index_daily(target_index_code, start_date="1991-01-01", end_date="2050-01-01")
+                        df_hist = _exclude_today_rows(df_hist, date_col="Date")
+                        df_new = df_hist.rename(columns={"Index_Close": "Close"})
+                        parse_msg = f"✅ 已从深证接口拉取 {len(df_new)} 条数据"
+                    except Exception as e:
+                        df_new, parse_msg = None, f"❌ 深证接口拉取失败: {e}"
+                    st.info(parse_msg)
 
-                if df_new is not None:
+                if df_new is not None and not df_new.empty:
                     with st.spinner("正在保存指数历史数据..."):
                         # 直接保存指数历史，etf_close_raw/etf_close_hfq=NULL，等待更新全部数据时拼接
                         df_to_save = df_new[['Date', 'Close']].copy()
@@ -1563,17 +1703,21 @@ with tab3:
                             scaling_factor=1.0,
                             stitch_date=df_new['Date'].max().date(),
                             index_code=target_index_code,
+                            data_source=target_data_source,
                         )
                         written_rows = save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'combined_close']], target_code)
-                        
+
                         st.session_state["etf_config_runtime"][target_name] = {
                             "name": target_name,
                             "etf_code": target_code,
                             "index_code": target_index_code,
                             "scaling_factor": 1.0,
+                            "data_source": target_data_source,
                         }
                         st.cache_data.clear()
-                        st.success(f"✅ 已新增：{target_name} ↔ {target_code}（指数代码: {target_index_code}），指数历史已保存")
+                        st.success(f"✅ 已新增：{target_name} ↔ {target_code}（{target_data_source} / {target_index_code}），指数历史已保存")
                         st.caption(f"🗄️ 本次落库 {written_rows} 条")
-                        st.info("💡 点击「更新全部数据」后：深证指数优先直连深证接口，其他指数走 ETF 拟合，并自动更新缩放比例")
+                        st.info("💡 点击「更新全部数据」后：SZ 走深证接口、ZZ 走 ETF 拟合、YH 走 Yahoo Finance，并自动更新缩放比例")
                         st.rerun()
+                else:
+                    st.error("❌ 未获取到可保存的历史数据，请检查指数代码/符号或数据源设置")
