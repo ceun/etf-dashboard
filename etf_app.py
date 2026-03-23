@@ -1357,9 +1357,21 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
         ticklabelmode='instant',
         **axis_common,
     )
+    fig.update_xaxes(
+        rangeslider=dict(
+            visible=True,
+            thickness=0.12,
+            bgcolor='rgba(242,246,252,0.95)',
+            bordercolor='rgba(189,200,217,0.9)',
+            borderwidth=1,
+        ),
+        row=2,
+        col=1,
+    )
     fig.update_layout(
         height=720,
         hovermode='x unified',
+        dragmode='pan',
         plot_bgcolor='white',
         paper_bgcolor='white',
         font=dict(family='PingFang SC, Microsoft YaHei, sans-serif', size=12),
