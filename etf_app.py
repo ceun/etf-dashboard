@@ -127,7 +127,7 @@ def save_target_to_db(index_code, name, etf_code=None, scaling_factor=None, stit
     try:
         cur = conn.cursor()
         normalized_index_code = _normalize_index_code(index_code)
-        normalized_etf_code = _normalize_etf_code(etf_code)
+        normalized_etf_code = _normalize_etf_code(etf_code) or None
         normalized_source = _normalize_data_source(data_source) if data_source else _infer_data_source_from_index_code(index_code)
         normalized_asset_currency = _normalize_currency(asset_currency) or "CNY"
         normalized_report_currency = _normalize_currency(report_currency) or "CNY"
@@ -2007,7 +2007,7 @@ with tab3:
                         df_to_save['combined_close'] = converted['combined_close']
                         
                         # 保存元数据和历史数据
-                        save_target_to_db(
+                        target_saved = save_target_to_db(
                             target_index_code,
                             target_name,
                             etf_code=target_etf_code or None,
@@ -2017,23 +2017,26 @@ with tab3:
                             asset_currency=target_asset_currency,
                             report_currency=target_report_currency,
                         )
-                        written_rows = save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']], target_index_code)
+                        if not target_saved:
+                            st.error("Target metadata save failed. Price import stopped.")
+                        else:
+                            written_rows = save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']], target_index_code)
 
-                        st.session_state["etf_config_runtime"][target_name] = {
-                            "name": target_name,
-                            "etf_code": target_etf_code,
-                            "index_code": target_index_code,
-                            "scaling_factor": 1.0,
-                            "data_source": target_data_source,
-                            "asset_currency": target_asset_currency,
-                            "report_currency": target_report_currency,
-                        }
-                        st.cache_data.clear()
-                        etf_hint = f" / ETF {target_etf_code}" if target_etf_code else ""
-                        st.success(f"✅ 已新增：{target_name}（{target_data_source} / {target_index_code}{etf_hint}），指数历史已保存")
-                        st.caption(f"🗄️ 本次落库 {written_rows} 条")
-                        st.info("💡 点击「更新全部数据」后：SZ 走深证接口、ZZ 走 ETF 拟合、YH 走 Yahoo Finance。未绑定 ETF 时会先只保存指数历史。")
-                        st.rerun()
+                            st.session_state["etf_config_runtime"][target_name] = {
+                                "name": target_name,
+                                "etf_code": target_etf_code,
+                                "index_code": target_index_code,
+                                "scaling_factor": 1.0,
+                                "data_source": target_data_source,
+                                "asset_currency": target_asset_currency,
+                                "report_currency": target_report_currency,
+                            }
+                            st.cache_data.clear()
+                            etf_hint = f" / ETF {target_etf_code}" if target_etf_code else ""
+                            st.success(f"Added: {target_name} ({target_data_source} / {target_index_code}{etf_hint}), index history saved.")
+                            st.caption(f"Rows written: {written_rows}")
+                            st.info("Update All Data: SZ uses SZSE, ZZ uses ETF stitching, YH uses Yahoo Finance. If ETF is not bound yet, only index history is saved first.")
+                            st.rerun()
                 else:
                     st.error("❌ 未获取到可保存的历史数据，请检查指数代码/符号或数据源设置")
 
