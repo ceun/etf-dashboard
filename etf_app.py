@@ -1773,26 +1773,26 @@ with tab1:
 
 with tab2:
     if not ACTIVE_ETF_CONFIG:
-        st.info("???????")
+        st.info("暂无标的数据。")
     else:
-        st.caption("????????????????????????????????")
+        st.caption("对比数据来自数据库，更新请点击侧边栏「更新全部数据」")
         ma_dev_col = f"ma_{ma_window}_deviation_pct"
         display_columns = {
-            "name": "??",
-            "etf_code": "ETF??",
-            "latest_date": "????",
-            "trad_deviation_pct": "?????(%)",
-            "roll_deviation_pct": "?????(%)",
-            ma_dev_col: f"MA{ma_window}???(%)",
-            "trad_cagr_pct": "??CAGR(%)",
-            "roll_cagr_pct": "??CAGR(%)",
-            "trad_cagr_range": "??????",
+            "name": "标的",
+            "etf_code": "ETF代码",
+            "latest_date": "最新日期",
+            "trad_deviation_pct": "传统偏离度(%)",
+            "roll_deviation_pct": "滚动偏离度(%)",
+            ma_dev_col: f"MA{ma_window}偏离度(%)",
+            "trad_cagr_pct": "传统CAGR(%)",
+            "roll_cagr_pct": "滚动CAGR(%)",
+            "trad_cagr_range": "传统年化范围",
         }
-        with st.spinner("????????..."):
+        with st.spinner("计算全市场偏离度..."):
             compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG, tradition_start, tradition_end, rolling_window, ma_window)
 
         if compare_df.empty:
-            st.info("????????")
+            st.info("无数据，请先拼接入库。")
         else:
             numeric_cols = ["trad_deviation_pct", "roll_deviation_pct", ma_dev_col]
             display_df = compare_df.rename(columns=display_columns)
@@ -1801,46 +1801,46 @@ with tab2:
                 subset=gradient_subset,
                 cmap="coolwarm", vmin=-100, vmax=100,
             ).format({
-                "?????(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "?",
-                "?????(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "?",
-                f"MA{ma_window}???(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "?",
-                "??CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "?",
-                "??CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "?",
+                "传统偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
+                "滚动偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
+                f"MA{ma_window}偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
+                "传统CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
+                "滚动CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
             })
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
             plot_df = compare_df.dropna(subset=["trad_deviation_pct", "roll_deviation_pct", ma_dev_col])
             if not plot_df.empty:
-                st.subheader("?????")
+                st.subheader("偏离度对比")
                 plot_df = plot_df.copy().sort_values("trad_deviation_pct", ascending=True)
 
                 fig2 = go.Figure()
                 fig2.add_trace(go.Bar(
                     y=plot_df["name"],
                     x=plot_df["trad_deviation_pct"],
-                    name="?????",
+                    name="传统偏离度",
                     orientation='h',
                     marker=dict(color="#BFDFD2"),
                     opacity=0.88,
-                    hovertemplate="??: %{y}<br>?????: %{x:+.2f}%<extra></extra>",
+                    hovertemplate="标的: %{y}<br>传统偏离度: %{x:+.2f}%<extra></extra>",
                 ))
                 fig2.add_trace(go.Bar(
                     y=plot_df["name"],
                     x=plot_df["roll_deviation_pct"],
-                    name="?????",
+                    name="滚动偏离度",
                     orientation='h',
                     marker=dict(color="#7BC0CD"),
                     opacity=0.88,
-                    hovertemplate="??: %{y}<br>?????: %{x:+.2f}%<extra></extra>",
+                    hovertemplate="标的: %{y}<br>滚动偏离度: %{x:+.2f}%<extra></extra>",
                 ))
                 fig2.add_trace(go.Bar(
                     y=plot_df["name"],
                     x=plot_df[ma_dev_col],
-                    name=f"MA{ma_window}???",
+                    name=f"MA{ma_window}偏离度",
                     orientation='h',
                     marker=dict(color="#2F9E44"),
                     opacity=0.88,
-                    hovertemplate="??: %{y}<br>MA???: %{x:+.2f}%<extra></extra>",
+                    hovertemplate=f"标的: %{{y}}<br>MA{ma_window}偏离度: %{{x:+.2f}}%<extra></extra>",
                 ))
 
                 fig2.add_vline(x=0, line_color="#666", line_width=1)
@@ -1861,7 +1861,7 @@ with tab2:
                         x=1,
                     ),
                 )
-                fig2.update_xaxes(title="??? (%)")
+                fig2.update_xaxes(title="偏离度 (%)")
                 fig2.update_yaxes(title=None)
                 st.plotly_chart(fig2, use_container_width=True)
 
