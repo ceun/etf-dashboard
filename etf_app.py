@@ -1393,43 +1393,43 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
 
 # ─── 全市场对比 ───────────────────────────────────────────────────────────────
 def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, rolling_window=1250, ma_window=250):
-    ma_dev_col = f"MA{ma_window}???(%)"
-    trad_range_col = "??????"
+    ma_dev_col = f"ma_{ma_window}_deviation_pct"
+    trad_range_col = "trad_cagr_range"
     rows = []
     for name, cfg in etf_config.items():
         display_etf_code = cfg.get('etf_code') or "-"
         try:
             df, scaling_factor = get_data(cfg['index_code'])
         except Exception as e:
-            rows.append({"??": name, "ETF??": display_etf_code,
-                         "????": f"????: {e}",
-                         "?????(%)": None, "?????(%)": None, ma_dev_col: None,
-                         "??CAGR(%)": None, "??CAGR(%)": None, trad_range_col: None})
+            rows.append({"name": name, "etf_code": display_etf_code,
+                         "latest_date": f"加载失败: {e}",
+                         "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
+                         "trad_cagr_pct": None, "roll_cagr_pct": None, trad_range_col: None})
             continue
         if df is None or len(df) < rolling_window + 10:
-            rows.append({"??": name, "ETF??": display_etf_code,
-                         "????": "???????????",
-                         "?????(%)": None, "?????(%)": None, ma_dev_col: None,
-                         "??CAGR(%)": None, "??CAGR(%)": None, trad_range_col: None})
+            rows.append({"name": name, "etf_code": display_etf_code,
+                         "latest_date": "无数据（请先拼接入库）",
+                         "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
+                         "trad_cagr_pct": None, "roll_cagr_pct": None, trad_range_col: None})
             continue
         try:
             fig, res = compute_and_plot(df, name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor)
             plt.close(fig)
             rows.append({
-                "??": name, "ETF??": display_etf_code,
-                "????": res['latest_date'],
-                "?????(%)": round(res['dev_trad'], 2),
-                "?????(%)": round(res['dev_roll'], 2),
+                "name": name, "etf_code": display_etf_code,
+                "latest_date": res['latest_date'],
+                "trad_deviation_pct": round(res['dev_trad'], 2),
+                "roll_deviation_pct": round(res['dev_roll'], 2),
                 ma_dev_col: round(res['dev_ma'], 2) if pd.notna(res['dev_ma']) else None,
-                "??CAGR(%)": round(res['cagr_trad'], 2),
-                "??CAGR(%)": round(res['cagr_roll'], 2),
+                "trad_cagr_pct": round(res['cagr_trad'], 2),
+                "roll_cagr_pct": round(res['cagr_roll'], 2),
                 trad_range_col: f"{res['trad_range_start']} ~ {res['trad_range_end']}",
             })
         except Exception as e:
-            rows.append({"??": name, "ETF??": display_etf_code,
-                         "????": f"??: {e}",
-                         "?????(%)": None, "?????(%)": None, ma_dev_col: None,
-                         "??CAGR(%)": None, "??CAGR(%)": None, trad_range_col: None})
+            rows.append({"name": name, "etf_code": display_etf_code,
+                         "latest_date": f"出错: {e}",
+                         "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
+                         "trad_cagr_pct": None, "roll_cagr_pct": None, trad_range_col: None})
     return pd.DataFrame(rows)
 
 
@@ -1773,62 +1773,74 @@ with tab1:
 
 with tab2:
     if not ACTIVE_ETF_CONFIG:
-        st.info("暂无标的数据。")
+        st.info("???????")
     else:
-        st.caption("对比数据来自数据库，更新请点击侧边栏「更新全部数据」")
-        ma_dev_col = f"MA{ma_window}偏离度(%)"
-        with st.spinner("计算全市场偏离度..."):
+        st.caption("????????????????????????????????")
+        ma_dev_col = f"ma_{ma_window}_deviation_pct"
+        display_columns = {
+            "name": "??",
+            "etf_code": "ETF??",
+            "latest_date": "????",
+            "trad_deviation_pct": "?????(%)",
+            "roll_deviation_pct": "?????(%)",
+            ma_dev_col: f"MA{ma_window}???(%)",
+            "trad_cagr_pct": "??CAGR(%)",
+            "roll_cagr_pct": "??CAGR(%)",
+            "trad_cagr_range": "??????",
+        }
+        with st.spinner("????????..."):
             compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG, tradition_start, tradition_end, rolling_window, ma_window)
 
         if compare_df.empty:
-            st.info("无数据，请先拼接入库。")
+            st.info("????????")
         else:
-            numeric_cols = ["传统偏离度(%)", "滚动偏离度(%)", ma_dev_col]
-            styled = compare_df.style.background_gradient(
-                subset=[c for c in numeric_cols if c in compare_df.columns],
+            numeric_cols = ["trad_deviation_pct", "roll_deviation_pct", ma_dev_col]
+            display_df = compare_df.rename(columns=display_columns)
+            gradient_subset = [display_columns[c] for c in numeric_cols if c in compare_df.columns]
+            styled = display_df.style.background_gradient(
+                subset=gradient_subset,
                 cmap="coolwarm", vmin=-100, vmax=100,
             ).format({
-                "传统偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
-                "滚动偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
-                ma_dev_col: lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
-                "传统CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
-                "滚动CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
+                "?????(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "?",
+                "?????(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "?",
+                f"MA{ma_window}???(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "?",
+                "??CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "?",
+                "??CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "?",
             })
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
-            plot_df = compare_df.dropna(subset=["传统偏离度(%)", "滚动偏离度(%)", ma_dev_col])
+            plot_df = compare_df.dropna(subset=["trad_deviation_pct", "roll_deviation_pct", ma_dev_col])
             if not plot_df.empty:
-                st.subheader("偏离度对比")
-                plot_df = plot_df.copy()
-                plot_df = plot_df.sort_values("传统偏离度(%)", ascending=True)
+                st.subheader("?????")
+                plot_df = plot_df.copy().sort_values("trad_deviation_pct", ascending=True)
 
                 fig2 = go.Figure()
                 fig2.add_trace(go.Bar(
-                    y=plot_df["标的"],
-                    x=plot_df["传统偏离度(%)"],
-                    name="传统偏离度",
+                    y=plot_df["name"],
+                    x=plot_df["trad_deviation_pct"],
+                    name="?????",
                     orientation='h',
                     marker=dict(color="#BFDFD2"),
                     opacity=0.88,
-                    hovertemplate="标的: %{y}<br>传统偏离度: %{x:+.2f}%<extra></extra>",
+                    hovertemplate="??: %{y}<br>?????: %{x:+.2f}%<extra></extra>",
                 ))
                 fig2.add_trace(go.Bar(
-                    y=plot_df["标的"],
-                    x=plot_df["滚动偏离度(%)"],
-                    name="滚动偏离度",
+                    y=plot_df["name"],
+                    x=plot_df["roll_deviation_pct"],
+                    name="?????",
                     orientation='h',
                     marker=dict(color="#7BC0CD"),
                     opacity=0.88,
-                    hovertemplate="标的: %{y}<br>滚动偏离度: %{x:+.2f}%<extra></extra>",
+                    hovertemplate="??: %{y}<br>?????: %{x:+.2f}%<extra></extra>",
                 ))
                 fig2.add_trace(go.Bar(
-                    y=plot_df["标的"],
+                    y=plot_df["name"],
                     x=plot_df[ma_dev_col],
-                    name=f"MA{ma_window}偏离度",
+                    name=f"MA{ma_window}???",
                     orientation='h',
                     marker=dict(color="#2F9E44"),
                     opacity=0.88,
-                    hovertemplate="标的: %{y}<br>MA偏离度: %{x:+.2f}%<extra></extra>",
+                    hovertemplate="??: %{y}<br>MA???: %{x:+.2f}%<extra></extra>",
                 ))
 
                 fig2.add_vline(x=0, line_color="#666", line_width=1)
@@ -1848,14 +1860,9 @@ with tab2:
                         xanchor="right",
                         x=1,
                     ),
-                    xaxis=dict(
-                        title="偏离度 (%)",
-                        zeroline=False,
-                        gridcolor="rgba(200,200,200,0.35)",
-                    ),
-                    yaxis=dict(title=""),
                 )
-
+                fig2.update_xaxes(title="??? (%)")
+                fig2.update_yaxes(title=None)
                 st.plotly_chart(fig2, use_container_width=True)
 
 with tab3:
