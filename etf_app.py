@@ -1231,9 +1231,17 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     }
 
 
-def render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window=1250, ma_window=250):
+def render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window=1250, ma_window=250, date_range=None):
     """使用 Plotly 渲染，现代简洁风格，含置信带、对数坐标、悬停。"""
     df       = res['plot_df'].copy()
+    if date_range is not None and len(date_range) == 2:
+        start_date = pd.to_datetime(date_range[0], errors='coerce')
+        end_date = pd.to_datetime(date_range[1], errors='coerce')
+        if pd.notna(start_date) and pd.notna(end_date):
+            df = df[(df['Date'] >= start_date) & (df['Date'] <= end_date)].copy()
+    if df.empty:
+        st.info("当前时间范围内暂无可展示数据。")
+        return
     z_plus   = float(res['z_plus'])
     z_minus  = float(res['z_minus'])
     std_trad = float(res['std_trad'])
@@ -1356,17 +1364,6 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
         tickformat='%Y',
         ticklabelmode='instant',
         **axis_common,
-    )
-    fig.update_xaxes(
-        rangeslider=dict(
-            visible=True,
-            thickness=0.12,
-            bgcolor='rgba(242,246,252,0.95)',
-            bordercolor='rgba(189,200,217,0.9)',
-            borderwidth=1,
-        ),
-        row=2,
-        col=1,
     )
     fig.update_layout(
         height=720,
@@ -1714,7 +1711,29 @@ with tab1:
         else:
             try:
                 fig, res = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor)
-                render_native_charts(res, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window)
+                plot_df = res['plot_df'].copy()
+                min_detail_date = plot_df['Date'].min().date()
+                max_detail_date = plot_df['Date'].max().date()
+                chart_placeholder = st.empty()
+                selected_detail_range = st.slider(
+                    "详情时间范围",
+                    min_value=min_detail_date,
+                    max_value=max_detail_date,
+                    value=(min_detail_date, max_detail_date),
+                    format="YYYY-MM-DD",
+                    key=f"detail_range_{index_code}",
+                )
+                with chart_placeholder.container():
+                    render_native_charts(
+                        res,
+                        etf_name,
+                        deviation_pct,
+                        tradition_start,
+                        tradition_end,
+                        rolling_window,
+                        ma_window,
+                        date_range=selected_detail_range,
+                    )
                 plt.close(fig)
 
                 st.caption("ETF价格展示口径：优先原生不复权；缺失时才使用缩放换算")
