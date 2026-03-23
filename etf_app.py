@@ -1207,6 +1207,8 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     
     return fig, {
         "latest_date":  df['Date'].iloc[-1].strftime('%Y-%m-%d'),
+        "trad_range_start": sample_df['Date'].iloc[0].strftime('%Y-%m-%d'),
+        "trad_range_end": sample_df['Date'].iloc[-1].strftime('%Y-%m-%d'),
         "latest_close": latest_close,
         "latest_etf_price": latest_etf_price,
         "trad_pred":    trad_pred,
@@ -1391,41 +1393,43 @@ def render_native_charts(res, etf_name, deviation_pct, tradition_start, traditio
 
 # ─── 全市场对比 ───────────────────────────────────────────────────────────────
 def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, rolling_window=1250, ma_window=250):
-    ma_dev_col = f"MA{ma_window}偏离度(%)"
+    ma_dev_col = f"MA{ma_window}???(%)"
+    trad_range_col = "??????"
     rows = []
     for name, cfg in etf_config.items():
         display_etf_code = cfg.get('etf_code') or "-"
         try:
             df, scaling_factor = get_data(cfg['index_code'])
         except Exception as e:
-            rows.append({"标的": name, "ETF代码": display_etf_code,
-                         "最新日期": f"加载失败: {e}",
-                         "传统偏离度(%)": None, "滚动偏离度(%)": None, ma_dev_col: None,
-                         "传统CAGR(%)": None, "滚动CAGR(%)": None})
+            rows.append({"??": name, "ETF??": display_etf_code,
+                         "????": f"????: {e}",
+                         "?????(%)": None, "?????(%)": None, ma_dev_col: None,
+                         "??CAGR(%)": None, "??CAGR(%)": None, trad_range_col: None})
             continue
         if df is None or len(df) < rolling_window + 10:
-            rows.append({"标的": name, "ETF代码": display_etf_code,
-                         "最新日期": "无数据（请先拼接入库）",
-                         "传统偏离度(%)": None, "滚动偏离度(%)": None, ma_dev_col: None,
-                         "传统CAGR(%)": None, "滚动CAGR(%)": None})
+            rows.append({"??": name, "ETF??": display_etf_code,
+                         "????": "???????????",
+                         "?????(%)": None, "?????(%)": None, ma_dev_col: None,
+                         "??CAGR(%)": None, "??CAGR(%)": None, trad_range_col: None})
             continue
         try:
             fig, res = compute_and_plot(df, name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor)
             plt.close(fig)
             rows.append({
-                "标的": name, "ETF代码": display_etf_code,
-                "最新日期":    res['latest_date'],
-                "传统偏离度(%)": round(res['dev_trad'], 2),
-                "滚动偏离度(%)": round(res['dev_roll'], 2),
+                "??": name, "ETF??": display_etf_code,
+                "????": res['latest_date'],
+                "?????(%)": round(res['dev_trad'], 2),
+                "?????(%)": round(res['dev_roll'], 2),
                 ma_dev_col: round(res['dev_ma'], 2) if pd.notna(res['dev_ma']) else None,
-                "传统CAGR(%)":   round(res['cagr_trad'], 2),
-                "滚动CAGR(%)":   round(res['cagr_roll'], 2),
+                "??CAGR(%)": round(res['cagr_trad'], 2),
+                "??CAGR(%)": round(res['cagr_roll'], 2),
+                trad_range_col: f"{res['trad_range_start']} ~ {res['trad_range_end']}",
             })
         except Exception as e:
-            rows.append({"标的": name, "ETF代码": display_etf_code,
-                         "最新日期": f"出错: {e}",
-                         "传统偏离度(%)": None, "滚动偏离度(%)": None, ma_dev_col: None,
-                         "传统CAGR(%)": None, "滚动CAGR(%)": None})
+            rows.append({"??": name, "ETF??": display_etf_code,
+                         "????": f"??: {e}",
+                         "?????(%)": None, "?????(%)": None, ma_dev_col: None,
+                         "??CAGR(%)": None, "??CAGR(%)": None, trad_range_col: None})
     return pd.DataFrame(rows)
 
 
@@ -2018,7 +2022,7 @@ with tab3:
                             report_currency=target_report_currency,
                         )
                         if not target_saved:
-                            st.error("Target metadata save failed. Price import stopped.")
+                            st.error("标的元数据保存失败，已停止行情入库。")
                         else:
                             written_rows = save_prices_to_db(df_to_save[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']], target_index_code)
 
@@ -2033,9 +2037,9 @@ with tab3:
                             }
                             st.cache_data.clear()
                             etf_hint = f" / ETF {target_etf_code}" if target_etf_code else ""
-                            st.success(f"Added: {target_name} ({target_data_source} / {target_index_code}{etf_hint}), index history saved.")
-                            st.caption(f"Rows written: {written_rows}")
-                            st.info("Update All Data: SZ uses SZSE, ZZ uses ETF stitching, YH uses Yahoo Finance. If ETF is not bound yet, only index history is saved first.")
+                            st.success(f"✅ 已新增：{target_name}（{target_data_source} / {target_index_code}{etf_hint}），指数历史已保存")
+                            st.caption(f"🗄️ 本次落库 {written_rows} 条")
+                            st.info("💡 点击「更新全部数据」后：SZ 走深证接口、ZZ 走 ETF 拟合、YH 走 Yahoo Finance。未绑定 ETF 时会先只保存指数历史。")
                             st.rerun()
                 else:
                     st.error("❌ 未获取到可保存的历史数据，请检查指数代码/符号或数据源设置")
