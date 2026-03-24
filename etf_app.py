@@ -1557,6 +1557,7 @@ def stitch_with_tickflow(history_df, etf_code, asset_currency="CNY", report_curr
     try:
         etf_df = fetch_all_from_tickflow(etf_code)
         etf_df = _exclude_today_rows(etf_df, date_col='Date')
+        etf_df = _resolve_etf_stitch_series(etf_df)
         if etf_df.empty:
             return None, 1.0, None, "❌ TickFlow暂无可落盘的历史日线（当日数据不会落盘）"
 
