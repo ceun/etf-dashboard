@@ -852,7 +852,7 @@ def _sync_data_from_yahoo(index_code: str):
 
 
 def _check_needs_full_stitch(index_code):
-    """检查标的是否需要完整拼接（历史数据 etf_close_raw 全为 NULL 但 index_close 有值）"""
+    """Check whether imported index history still lacks an ETF-stitched tail after the last index date."""
     meta = _get_target_meta(index_code)
     if not _normalize_etf_code(meta.get("etf_code")):
         return False
@@ -860,19 +860,37 @@ def _check_needs_full_stitch(index_code):
     if not conn:
         return False
     try:
+        normalized_index_code = _normalize_index_code(index_code)
         res = pd.read_sql(
-            """SELECT 
-                COUNT(CASE WHEN index_close IS NOT NULL THEN 1 END) AS has_index,
-                COUNT(CASE WHEN etf_close_raw IS NOT NULL OR etf_close_hfq IS NOT NULL THEN 1 END) AS has_etf_price
-            FROM etf_prices WHERE index_code=%s""",
-            conn, params=(_normalize_index_code(index_code),),
+            """
+            WITH history_tail AS (
+                SELECT MAX(date) AS last_index_date
+                FROM etf_prices
+                WHERE index_code=%s
+                  AND index_close IS NOT NULL
+            )
+            SELECT
+                h.last_index_date,
+                COUNT(*) FILTER (
+                    WHERE p.date > h.last_index_date
+                      AND p.index_close IS NULL
+                      AND p.combined_close IS NOT NULL
+                      AND (p.etf_close_raw IS NOT NULL OR p.etf_close_hfq IS NOT NULL)
+                ) AS stitched_after_tail
+            FROM history_tail h
+            LEFT JOIN etf_prices p
+              ON p.index_code=%s
+            GROUP BY h.last_index_date
+            """,
+            conn,
+            params=(normalized_index_code, normalized_index_code),
         )
         conn.close()
         if res.empty:
             return False
-        has_index = res.iloc[0]['has_index'] > 0
-        has_etf = res.iloc[0]['has_etf_price'] == 0
-        return has_index and has_etf  # 有指数数据但 etf_close_raw 全为 NULL
+        last_index_date = res.iloc[0]['last_index_date']
+        stitched_after_tail = int(res.iloc[0]['stitched_after_tail']) if pd.notna(res.iloc[0]['stitched_after_tail']) else 0
+        return pd.notna(last_index_date) and stitched_after_tail == 0
     except Exception:
         return False
 
