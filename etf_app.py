@@ -944,36 +944,34 @@ def _full_stitch_from_db(index_code):
         if stitch_date is None:
             return False
         
-        # 构造拼接结果：历史段 + 新增段
-        hist_part = df_hist.copy()
-        hist_part = pd.merge(hist_part, etf_df, on='Date', how='left')
-        hist_part = hist_part.rename(columns={'index_close_val': 'index_close', 'ETF_Close_Raw': 'etf_close_raw', 'ETF_Close_HFQ': 'etf_close_hfq'})
-        hist_native = hist_part[['Date', 'index_close']].rename(columns={'index_close': 'Index_Close'})
-        hist_conv = _apply_currency_conversion(hist_native, asset_currency=asset_currency, report_currency=report_currency)
-        hist_part['asset_close_native'] = hist_conv['asset_close_native']
-        hist_part['fx_to_cny'] = hist_conv['fx_to_cny']
-        hist_part['close_cny'] = hist_conv['close_cny']
-        hist_part['combined_close'] = hist_conv['combined_close']
-        
-        last_hist_date = df_hist['Date'].max()
-        new_part = etf_df[etf_df['Date'] > last_hist_date].copy()
-        new_part = new_part.rename(columns={'ETF_Close_Raw': 'etf_close_raw', 'ETF_Close_HFQ': 'etf_close_hfq'})
-        new_part['index_close'] = None
-        new_native = pd.DataFrame({
-            'Date': new_part['Date'],
-            'Index_Close': new_part['ETF_Price_For_Stitch'] * scaling_factor,
-        })
-        new_conv = _apply_currency_conversion(new_native, asset_currency=asset_currency, report_currency=report_currency)
-        new_part['asset_close_native'] = new_conv['asset_close_native']
-        new_part['fx_to_cny'] = new_conv['fx_to_cny']
-        new_part['close_cny'] = new_conv['close_cny']
-        new_part['combined_close'] = new_conv['combined_close']
-        
-        result = pd.concat(
-            [hist_part[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']],
-             new_part[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']]],
-            ignore_index=True,
+        # 构造拼接结果：合并历史和ETF，确保所有日期都被包含
+        merged = pd.merge(
+            df_hist.rename(columns={'index_close_val': 'index_close'}),
+            etf_df,
+            on='Date',
+            how='outer'
         ).sort_values('Date').reset_index(drop=True)
+        
+        merged = merged.rename(columns={'ETF_Close_Raw': 'etf_close_raw', 'ETF_Close_HFQ': 'etf_close_hfq'})
+        merged['index_close'] = pd.to_numeric(merged['index_close'], errors='coerce')
+        merged['etf_price_for_stitch'] = pd.to_numeric(merged['ETF_Price_For_Stitch'], errors='coerce')
+
+        # 构造用于换算的 `combined_close`
+        last_hist_date = df_hist['Date'].max()
+        price_for_conversion = merged['index_close'].copy()
+        new_part_mask = merged['Date'] > last_hist_date
+        price_for_conversion.loc[new_part_mask] = merged.loc[new_part_mask, 'etf_price_for_stitch'] * scaling_factor
+
+        # 统一应用汇率换算
+        converted = _apply_currency_conversion(
+            pd.DataFrame({'Date': merged['Date'], 'Index_Close': price_for_conversion}),
+            asset_currency=asset_currency,
+            report_currency=report_currency,
+        )
+
+        # 整理最终列
+        result = merged[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq']].copy()
+        result = pd.merge(result, converted[['Date', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']], on='Date', how='left')
         
         # 更新 DB
         written_rows = save_prices_to_db(result, index_code)
@@ -1593,45 +1591,31 @@ def stitch_with_tickflow(history_df, etf_code, asset_currency="CNY", report_curr
             stitch_date    = history_df['Date'].max().date()
             msg_prefix = "⚠️ 历史数据与 TickFlow 无重叠日期，缩放比例暂设为 1.0"
 
-        # 历史段：所有历史日期（index_close有值）
-        hist = history_df[['Date', 'Close']].rename(columns={'Close': 'index_close'}).copy()
-        hist = pd.merge(hist, etf_df, on='Date', how='left')
-        hist['etf_close_raw'] = pd.to_numeric(hist['ETF_Close_Raw'], errors='coerce')
-        hist['etf_close_hfq'] = pd.to_numeric(hist['ETF_Close_HFQ'], errors='coerce')
-        hist_conv = _apply_currency_conversion(
-            hist[['Date', 'index_close']].rename(columns={'index_close': 'Index_Close'}),
+        # 基于外连接的完整数据集，填充并计算衍生列
+        last_hist_date = history_df['Date'].max()
+        merged['index_close'] = pd.to_numeric(merged['index_close'], errors='coerce')
+
+        # 构造用于换算和最终输出的 `combined_close`
+        # 规则：历史段用真实指数，新增段用 ETF 价格 * 缩放比例
+        price_for_conversion = merged['index_close'].copy()
+        new_part_mask = merged['Date'] > last_hist_date
+        # 仅填充新采集部分的 index close（原历史部分维持原样）
+        price_for_conversion.loc[new_part_mask] = merged.loc[new_part_mask, 'etf_price_for_stitch'] * scaling_factor
+        
+        # 统一应用汇率换算
+        converted = _apply_currency_conversion(
+            pd.DataFrame({'Date': merged['Date'], 'Index_Close': price_for_conversion}),
             asset_currency=asset_currency,
             report_currency=report_currency,
         )
-        hist['asset_close_native'] = hist_conv['asset_close_native']
-        hist['fx_to_cny'] = hist_conv['fx_to_cny']
-        hist['close_cny'] = hist_conv['close_cny']
-        hist['combined_close'] = hist_conv['combined_close']
 
-        # 近期段：TickFlow 独有日期（晚于历史最新日期）
-        last_hist = history_df['Date'].max()
-        recent = etf_df[etf_df['Date'] > last_hist].copy()
-        recent['etf_close_raw'] = pd.to_numeric(recent['ETF_Close_Raw'], errors='coerce')
-        recent['etf_close_hfq'] = pd.to_numeric(recent['ETF_Close_HFQ'], errors='coerce')
-        recent['index_close']    = None
-        recent_conv = _apply_currency_conversion(
-            pd.DataFrame({'Date': recent['Date'], 'Index_Close': recent['ETF_Price_For_Stitch'] * scaling_factor}),
-            asset_currency=asset_currency,
-            report_currency=report_currency,
-        )
-        recent['asset_close_native'] = recent_conv['asset_close_native']
-        recent['fx_to_cny'] = recent_conv['fx_to_cny']
-        recent['close_cny'] = recent_conv['close_cny']
-        recent['combined_close'] = recent_conv['combined_close']
+        # 整理最终列
+        result = merged[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq']].copy()
+        result = pd.merge(result, converted[['Date', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']], on='Date', how='left')
 
-        result = pd.concat(
-            [hist[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']],
-             recent[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']]],
-            ignore_index=True,
-        ).sort_values('Date').reset_index(drop=True)
-
+        num_new = (merged['Date'] > last_hist_date).sum()
         return result, scaling_factor, stitch_date, \
-               msg_prefix + f"，新增近期 {len(recent)} 条"
+               msg_prefix + f"，新增近期 {num_new} 条"
     except Exception as e:
         return None, 1.0, None, f"❌ 拼接失败: {e}"
 
