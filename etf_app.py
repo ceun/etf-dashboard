@@ -590,6 +590,14 @@ def _apply_currency_conversion(price_df, asset_currency, report_currency="CNY"):
     return work
 
 
+def _resolve_etf_stitch_series(df, raw_col="ETF_Close_Raw", hfq_col="ETF_Close_HFQ", out_col="ETF_Price_For_Stitch"):
+    work = df.copy()
+    raw_series = pd.to_numeric(work[raw_col], errors="coerce") if raw_col in work.columns else pd.Series(np.nan, index=work.index)
+    hfq_series = pd.to_numeric(work[hfq_col], errors="coerce") if hfq_col in work.columns else pd.Series(np.nan, index=work.index)
+    work[out_col] = hfq_series.where(hfq_series.notna(), raw_series)
+    return work
+
+
 def _estimate_scaling_factor_from_overlap(index_df, etf_code, default_sf=1.0):
     """用最近重叠窗口的中位数比值估算缩放比例，提升 ETF 价格换算稳定性。"""
     try:
@@ -599,18 +607,19 @@ def _estimate_scaling_factor_from_overlap(index_df, etf_code, default_sf=1.0):
         etf_recent = fetch_recent_from_tickflow(etf_code, count=400)
         if etf_recent.empty:
             return float(default_sf)
+        etf_recent = _resolve_etf_stitch_series(etf_recent)
         merged = pd.merge(
             index_df[["Date", "Index_Close"]],
-            etf_recent[["Date", "ETF_Close_Raw"]],
+            etf_recent[["Date", "ETF_Price_For_Stitch"]],
             on="Date",
             how="inner",
         )
         if merged.empty:
             return float(default_sf)
-        merged = merged[(merged["Index_Close"] > 0) & (merged["ETF_Close_Raw"] > 0)].copy()
+        merged = merged[(merged["Index_Close"] > 0) & (merged["ETF_Price_For_Stitch"] > 0)].copy()
         if merged.empty:
             return float(default_sf)
-        merged["ratio"] = merged["Index_Close"] / merged["ETF_Close_Raw"]
+        merged["ratio"] = merged["Index_Close"] / merged["ETF_Price_For_Stitch"]
         ratio = pd.to_numeric(merged["ratio"], errors="coerce").dropna()
         if ratio.empty:
             return float(default_sf)
@@ -854,7 +863,7 @@ def _check_needs_full_stitch(index_code):
         res = pd.read_sql(
             """SELECT 
                 COUNT(CASE WHEN index_close IS NOT NULL THEN 1 END) AS has_index,
-                COUNT(CASE WHEN etf_close_raw IS NOT NULL THEN 1 END) AS has_etf_raw
+                COUNT(CASE WHEN etf_close_raw IS NOT NULL OR etf_close_hfq IS NOT NULL THEN 1 END) AS has_etf_price
             FROM etf_prices WHERE index_code=%s""",
             conn, params=(_normalize_index_code(index_code),),
         )
@@ -862,7 +871,7 @@ def _check_needs_full_stitch(index_code):
         if res.empty:
             return False
         has_index = res.iloc[0]['has_index'] > 0
-        has_etf = res.iloc[0]['has_etf_raw'] == 0
+        has_etf = res.iloc[0]['has_etf_price'] == 0
         return has_index and has_etf  # 有指数数据但 etf_close_raw 全为 NULL
     except Exception:
         return False
@@ -897,8 +906,10 @@ def _full_stitch_from_db(index_code):
         # 拉取 ETF 完整历史
         etf_df = fetch_all_from_tickflow(etf_code)
         etf_df = _exclude_today_rows(etf_df, date_col='Date')
+        etf_df = _resolve_etf_stitch_series(etf_df)
         if etf_df.empty:
             return False
+        etf_df = _resolve_etf_stitch_series(etf_df)
         
         # 用重叠窗口多点拟合缩放比例（避免单点锚定偏差）
         merged = pd.merge(df_hist, etf_df, on='Date', how='inner')
@@ -908,7 +919,7 @@ def _full_stitch_from_db(index_code):
         scaling_factor, stitch_date, _ = _estimate_scaling_from_merged(
             merged,
             index_col='index_close_val',
-            etf_col='ETF_Close_Raw',
+            etf_col='ETF_Price_For_Stitch',
             default_sf=1.0,
             window=250,
         )
@@ -932,7 +943,7 @@ def _full_stitch_from_db(index_code):
         new_part['index_close'] = None
         new_native = pd.DataFrame({
             'Date': new_part['Date'],
-            'Index_Close': new_part['etf_close_raw'] * scaling_factor,
+            'Index_Close': new_part['ETF_Price_For_Stitch'] * scaling_factor,
         })
         new_conv = _apply_currency_conversion(new_native, asset_currency=asset_currency, report_currency=report_currency)
         new_part['asset_close_native'] = new_conv['asset_close_native']
@@ -975,6 +986,7 @@ def _incremental_tickflow_update(index_code, etf_code, scaling_factor):
     recent_all = _exclude_today_rows(recent_all, date_col='Date')
     if recent_all.empty:
         return 0
+    recent_all = _resolve_etf_stitch_series(recent_all)
 
     patch_data = _keep_last_n_trading_days(recent_all, n=3, date_col='Date')
     if patch_data.empty:
@@ -984,7 +996,7 @@ def _incremental_tickflow_update(index_code, etf_code, scaling_factor):
     patch_data['index_close'] = None
     native_df = pd.DataFrame({
         'Date': patch_data['Date'],
-        'Index_Close': patch_data['etf_close_raw'] * scaling_factor,
+        'Index_Close': patch_data['ETF_Price_For_Stitch'] * scaling_factor,
     })
     conv = _apply_currency_conversion(native_df, asset_currency=asset_currency, report_currency=report_currency)
     patch_data['asset_close_native'] = conv['asset_close_native']
@@ -1032,6 +1044,7 @@ def sync_data_from_tickflow(index_code: str):
         if raw.empty:
             df_latest, scaling_factor_latest = load_from_db(index_code)
             return df_latest, scaling_factor_latest, 0
+        raw = _resolve_etf_stitch_series(raw)
         target_name = _get_target_name(index_code)
         save_target_to_db(
             index_code,
@@ -1050,7 +1063,7 @@ def sync_data_from_tickflow(index_code: str):
         })
         base_native = pd.DataFrame({
             'Date': raw['Date'],
-            'Index_Close': raw['ETF_Close_Raw'],
+            'Index_Close': raw['ETF_Price_For_Stitch'],
         })
         base_conv = _apply_currency_conversion(
             base_native,
@@ -1538,14 +1551,15 @@ def stitch_with_tickflow(history_df, etf_code, asset_currency="CNY", report_curr
 
         merged['etf_close_raw'] = pd.to_numeric(merged['ETF_Close_Raw'], errors='coerce')
         merged['etf_close_hfq'] = pd.to_numeric(merged['ETF_Close_HFQ'], errors='coerce')
+        merged['etf_price_for_stitch'] = pd.to_numeric(merged['ETF_Price_For_Stitch'], errors='coerce')
 
         # 使用重叠窗口多点拟合缩放比例，找不到重叠样本才回落到 1.0
-        overlap = merged[merged['index_close'].notna() & merged['etf_close_raw'].notna()]
+        overlap = merged[merged['index_close'].notna() & merged['etf_price_for_stitch'].notna()]
         if not overlap.empty:
             scaling_factor, stitch_date, used_n = _estimate_scaling_from_merged(
                 overlap,
                 index_col='index_close',
-                etf_col='etf_close_raw',
+                etf_col='etf_price_for_stitch',
                 default_sf=1.0,
                 window=250,
             )
@@ -1582,7 +1596,7 @@ def stitch_with_tickflow(history_df, etf_code, asset_currency="CNY", report_curr
         recent['etf_close_hfq'] = pd.to_numeric(recent['ETF_Close_HFQ'], errors='coerce')
         recent['index_close']    = None
         recent_conv = _apply_currency_conversion(
-            pd.DataFrame({'Date': recent['Date'], 'Index_Close': recent['etf_close_raw'] * scaling_factor}),
+            pd.DataFrame({'Date': recent['Date'], 'Index_Close': recent['ETF_Price_For_Stitch'] * scaling_factor}),
             asset_currency=asset_currency,
             report_currency=report_currency,
         )
