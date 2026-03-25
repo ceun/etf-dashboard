@@ -910,10 +910,9 @@ def _full_stitch_from_db(index_code):
         merged['etf_price_for_stitch'] = pd.to_numeric(merged['ETF_Price_For_Stitch'], errors='coerce')
 
         # 构造用于换算的 `combined_close`
-        last_hist_date = df_hist['Date'].max()
-        price_for_conversion = merged['index_close'].copy()
-        new_part_mask = merged['Date'] > last_hist_date
-        price_for_conversion.loc[new_part_mask] = merged.loc[new_part_mask, 'etf_price_for_stitch'] * scaling_factor
+        # 规则：优先使用真实指数，当指数为空时，用 ETF 价格 * 缩放比例 回填
+        scaled_etf_price = merged['etf_price_for_stitch'] * scaling_factor
+        price_for_conversion = merged['index_close'].fillna(scaled_etf_price)
 
         # 统一应用汇率换算
         converted = _apply_currency_conversion(
@@ -1602,11 +1601,9 @@ def stitch_with_tickflow(history_df, etf_code, asset_currency="CNY", report_curr
         merged['index_close'] = pd.to_numeric(merged['index_close'], errors='coerce')
 
         # 构造用于换算和最终输出的 `combined_close`
-        # 规则：历史段用真实指数，新增段用 ETF 价格 * 缩放比例
-        price_for_conversion = merged['index_close'].copy()
-        new_part_mask = merged['Date'] > last_hist_date
-        # 仅填充新采集部分的 index close（原历史部分维持原样）
-        price_for_conversion.loc[new_part_mask] = merged.loc[new_part_mask, 'etf_price_for_stitch'] * scaling_factor
+        # 规则：优先使用真实指数，当指数为空时，用 ETF 价格 * 缩放比例 回填
+        scaled_etf_price = merged['etf_price_for_stitch'] * scaling_factor
+        price_for_conversion = merged['index_close'].fillna(scaled_etf_price)
         
         # 统一应用汇率换算
         converted = _apply_currency_conversion(
