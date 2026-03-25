@@ -754,54 +754,7 @@ def _get_target_meta(index_code, default_name=None):
 
 
 
-def _sync_data_from_yahoo(index_code: str):
-    """Yahoo Finance 直连同步：指数点位直接入库，并附带 ETF 行情用于展示换算。"""
-    _delete_today_prices_from_db(index_code)
-    hist = fetch_yahoo_history(index_code, start_date="1991-01-01")
-    hist = _exclude_today_rows(hist, date_col="Date")
-    if hist.empty:
-        raise RuntimeError(f"Yahoo Finance 无可落盘数据: {index_code}")
 
-    meta = _get_target_meta(index_code)
-    etf_code = _normalize_etf_code(meta.get("etf_code"))
-    asset_currency = _normalize_currency(meta.get("asset_currency")) or "CNY"
-    report_currency = _normalize_currency(meta.get("report_currency")) or "CNY"
-    sf = _estimate_scaling_factor_from_overlap(hist, etf_code, default_sf=meta["scaling_factor"] if etf_code else 1.0)
-
-    if etf_code:
-        etf_all = fetch_all_from_tickflow(etf_code)
-        etf_all = _exclude_today_rows(etf_all, date_col="Date")
-        merged = pd.merge(hist, etf_all, on="Date", how="left")
-    else:
-        merged = hist.copy()
-        merged["ETF_Close_Raw"] = None
-        merged["ETF_Close_HFQ"] = None
-
-    converted = _apply_currency_conversion(merged[["Date", "Index_Close"]], asset_currency=asset_currency, report_currency=report_currency)
-    rows = pd.DataFrame({
-        "Date": merged["Date"],
-        "index_close": merged["Index_Close"],
-        "etf_close_raw": merged["ETF_Close_Raw"],
-        "etf_close_hfq": merged["ETF_Close_HFQ"],
-        "asset_close_native": converted["asset_close_native"],
-        "fx_to_cny": converted["fx_to_cny"],
-        "close_cny": converted["close_cny"],
-        "combined_close": converted["combined_close"],
-    })
-    written_rows = save_prices_to_db(rows[["Date", "index_close", "etf_close_raw", "etf_close_hfq", "asset_close_native", "fx_to_cny", "close_cny", "combined_close"]], index_code)
-
-    target_name = meta["name"]
-    save_target_to_db(
-        index_code,
-        target_name,
-        etf_code=etf_code or None,
-        scaling_factor=sf,
-        stitch_date=hist["Date"].max().date(),
-        data_source="YH",
-        asset_currency=asset_currency,
-        report_currency=report_currency,
-    )
-    return int(written_rows)
 
 
 def _check_needs_full_stitch(index_code):
@@ -1760,10 +1713,8 @@ with tab1:
                     )
                 plt.close(fig)
 
-                st.caption("ETF价格展示口径：优先原生不复权；缺失时才使用缩放换算")
-
                 st.divider()
-                st.subheader("指数点位 & ETF价格")
+                st.subheader("指数点位 & ETF价格", help="ETF价格展示口径：优先展示原生不复权；当部分历史缺失时，将使用对应的指数点位缩放估算。")
                 c1, c2, c3 = st.columns(3)
                 c1.metric("最新日期", res['latest_date'])
                 c2.metric("指数点位", f"{res['latest_close']:,.0f}")
