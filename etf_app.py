@@ -751,54 +751,7 @@ def _get_target_meta(index_code, default_name=None):
         return fallback
 
 
-def _sync_data_from_szse_index(index_code: str):
-    """深证指数直连同步：指数点位直接入库，避免 ETF 反推误差。"""
-    _delete_today_prices_from_db(index_code)
-    hist = fetch_szse_index_daily(index_code=index_code, start_date="1991-01-01", end_date="2050-01-01")
-    hist = _exclude_today_rows(hist, date_col="Date")
-    if hist.empty:
-        raise RuntimeError(f"深证指数无可落盘数据: {index_code}")
 
-    meta = _get_target_meta(index_code)
-    etf_code = _normalize_etf_code(meta.get("etf_code"))
-    asset_currency = _normalize_currency(meta.get("asset_currency")) or "CNY"
-    report_currency = _normalize_currency(meta.get("report_currency")) or "CNY"
-    sf = _estimate_scaling_factor_from_overlap(hist, etf_code, default_sf=meta["scaling_factor"] if etf_code else 1.0)
-
-    if etf_code:
-        etf_all = fetch_all_from_tickflow(etf_code)
-        etf_all = _exclude_today_rows(etf_all, date_col="Date")
-        merged = pd.merge(hist, etf_all, on="Date", how="left")
-    else:
-        merged = hist.copy()
-        merged["ETF_Close_Raw"] = None
-        merged["ETF_Close_HFQ"] = None
-
-    converted = _apply_currency_conversion(merged[["Date", "Index_Close"]], asset_currency=asset_currency, report_currency=report_currency)
-    rows = pd.DataFrame({
-        "Date": merged["Date"],
-        "index_close": merged["Index_Close"],
-        "etf_close_raw": merged["ETF_Close_Raw"],
-        "etf_close_hfq": merged["ETF_Close_HFQ"],
-        "asset_close_native": converted["asset_close_native"],
-        "fx_to_cny": converted["fx_to_cny"],
-        "close_cny": converted["close_cny"],
-        "combined_close": converted["combined_close"],
-    })
-    written_rows = save_prices_to_db(rows[["Date", "index_close", "etf_close_raw", "etf_close_hfq", "asset_close_native", "fx_to_cny", "close_cny", "combined_close"]], index_code)
-
-    target_name = meta["name"]
-    save_target_to_db(
-        index_code,
-        target_name,
-        etf_code=etf_code or None,
-        scaling_factor=sf,
-        stitch_date=hist["Date"].max().date(),
-        data_source="SZ",
-        asset_currency=asset_currency,
-        report_currency=report_currency,
-    )
-    return int(written_rows)
 
 
 def _sync_data_from_yahoo(index_code: str):
@@ -1035,7 +988,60 @@ def sync_data_from_tickflow(index_code: str):
 
     if data_source == "SZ":
         try:
-            written_rows = _sync_data_from_szse_index(index_code)
+            _delete_today_prices_from_db(index_code)
+            df_existing, _ = load_from_db(index_code)
+            start_date = "1991-01-01"
+            if df_existing is not None and not df_existing.empty:
+                last_date = df_existing['Date'].max().date()
+                start_date = (last_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+
+            hist = fetch_szse_index_daily(index_code=index_code, start_date=start_date, end_date="2050-01-01")
+            hist = _exclude_today_rows(hist, date_col="Date")
+            
+            written_rows = 0
+            if not hist.empty:
+                meta = _get_target_meta(index_code)
+                etf_code = _normalize_etf_code(meta.get("etf_code"))
+                asset_currency = _normalize_currency(meta.get("asset_currency")) or "CNY"
+                report_currency = _normalize_currency(meta.get("report_currency")) or "CNY"
+                
+                # 增量更新时，应基于全量数据估算sf，但为简化起见，此处复用已有逻辑
+                sf = _estimate_scaling_factor_from_overlap(hist, etf_code, default_sf=meta["scaling_factor"] if etf_code else 1.0)
+
+                if etf_code:
+                    etf_all = fetch_all_from_tickflow(etf_code)
+                    etf_all = _exclude_today_rows(etf_all, date_col="Date")
+                    merged = pd.merge(hist, etf_all, on="Date", how="left")
+                else:
+                    merged = hist.copy()
+                    merged["ETF_Close_Raw"] = None
+                    merged["ETF_Close_HFQ"] = None
+
+                converted = _apply_currency_conversion(merged[["Date", "Index_Close"]], asset_currency=asset_currency, report_currency=report_currency)
+                rows = pd.DataFrame({
+                    "Date": merged["Date"],
+                    "index_close": merged["Index_Close"],
+                    "etf_close_raw": merged["ETF_Close_Raw"],
+                    "etf_close_hfq": merged["ETF_Close_HFQ"],
+                    "asset_close_native": converted["asset_close_native"],
+                    "fx_to_cny": converted["fx_to_cny"],
+                    "close_cny": converted["close_cny"],
+                    "combined_close": converted["combined_close"],
+                })
+                written_rows = save_prices_to_db(rows[["Date", "index_close", "etf_close_raw", "etf_close_hfq", "asset_close_native", "fx_to_cny", "close_cny", "combined_close"]], index_code)
+
+                target_name = meta["name"]
+                save_target_to_db(
+                    index_code,
+                    target_name,
+                    etf_code=etf_code or None,
+                    scaling_factor=sf,
+                    stitch_date=hist["Date"].max().date(),
+                    data_source="SZ",
+                    asset_currency=asset_currency,
+                    report_currency=report_currency,
+                )
+
             df_latest, scaling_factor_latest = load_from_db(index_code)
             return df_latest, scaling_factor_latest, int(written_rows)
         except Exception as e:
@@ -1951,7 +1957,7 @@ with tab3:
                             st.caption(f"🗄️ 本次落库 {written_rows} 条")
 
     elif mode == "新增标的：绑定并导入":
-        st.subheader("➕ 新增标的（标的名称 + 指数代码/符号；ZZ 需 ETF 和历史文件，SZ/YH 可先不绑定 ETF）")
+        st.subheader("➕ 新增标的（标的名称 + 指数代码/符号；ZZ 需 ETF 和历史文件，SZ 可选传或在线拉取）")
         st.caption("说明：`index_code` 是主键。`SZ` 走深证接口，`ZZ` 走 ETF 拼接，`YH` 走 Yahoo Finance。")
 
         col_name, col_code, col_index, col_source, col_currency = st.columns(5)
@@ -1971,12 +1977,17 @@ with tab3:
             new_history_file = st.file_uploader(
                 "上传该标的的指数历史文件（xlsx/xls/csv）",
                 type=['xlsx', 'xls', 'csv'],
-                key="new_target_history_file",
+                key="new_target_history_file_zz",
+            )
+        elif new_data_source == "SZ":
+            st.info("对于 SZ 标的，可上传本地历史文件（推荐）；若不上传，则将从在线接口全量拉取。")
+            new_history_file = st.file_uploader(
+                "上传指数历史文件（可选）",
+                type=['xlsx', 'xls', 'csv'],
+                key="new_target_history_file_sz",
             )
         elif new_data_source == "YH":
             st.info("YH 模式会直接从 Yahoo Finance 拉取全量历史数据并保存，无需上传历史文件。")
-        else:
-            st.info("SZ 模式更新时会从深证接口全量拉取数据，无需上传历史文件。")
 
         if st.button("➕ 绑定并导入", use_container_width=True, type="primary"):
             target_name = (new_etf_name or "").strip()
@@ -1986,18 +1997,32 @@ with tab3:
             target_asset_currency = _normalize_currency(new_asset_currency) or "CNY"
             target_report_currency = "CNY"
 
-            needs_file = target_data_source == "ZZ"
-            needs_etf = target_data_source == "ZZ"
-            if not target_name or not target_index_code or (needs_file and new_history_file is None) or (needs_etf and not target_etf_code):
-                st.error("❌ 必须提供：标的名称、指数代码；ZZ 数据源还必须提供 ETF 代码和指数历史文件")
+            # ZZ源必须有ETF和文件；其他源ETF可选；SZ源文件可选
+            if target_data_source == "ZZ" and not target_etf_code:
+                st.error("❌ ZZ 数据源必须提供 ETF 代码")
+            elif target_data_source == "ZZ" and new_history_file is None:
+                st.error("❌ ZZ 数据源必须提供指数历史文件")
+            elif not target_name or not target_index_code:
+                st.error("❌ 必须提供标的名称和指数代码")
             elif target_name in ACTIVE_ETF_CONFIG:
                 st.error(f"❌ 标的 {target_name} 已存在，请更换名称")
             elif any(cfg.get("index_code") == target_index_code for cfg in ACTIVE_ETF_CONFIG.values()):
                 st.error(f"❌ 指数代码 {target_index_code} 已存在，请直接使用已有标的")
             else:
+                df_new, parse_msg = None, ""
                 if target_data_source == "ZZ":
                     df_new, parse_msg = parse_upload_file(new_history_file)
-                    st.info(parse_msg)
+                elif target_data_source == "SZ":
+                    if new_history_file:
+                        df_new, parse_msg = parse_upload_file(new_history_file)
+                    else:
+                        try:
+                            df_hist = fetch_szse_index_daily(target_index_code, start_date="1991-01-01", end_date="2050-01-01")
+                            df_hist = _exclude_today_rows(df_hist, date_col="Date")
+                            df_new = df_hist.rename(columns={"Index_Close": "Close"})
+                            parse_msg = f"✅ 已从深证接口拉取 {len(df_new)} 条数据"
+                        except Exception as e:
+                            df_new, parse_msg = None, f"❌ 深证接口拉取失败: {e}"
                 elif target_data_source == "YH":
                     try:
                         df_hist = fetch_yahoo_history(target_index_code, start_date="1991-01-01")
@@ -2006,15 +2031,8 @@ with tab3:
                         parse_msg = f"✅ 已从 Yahoo Finance 拉取 {len(df_new)} 条数据"
                     except Exception as e:
                         df_new, parse_msg = None, f"❌ Yahoo Finance 拉取失败: {e}"
-                    st.info(parse_msg)
-                else:
-                    try:
-                        df_hist = fetch_szse_index_daily(target_index_code, start_date="1991-01-01", end_date="2050-01-01")
-                        df_hist = _exclude_today_rows(df_hist, date_col="Date")
-                        df_new = df_hist.rename(columns={"Index_Close": "Close"})
-                        parse_msg = f"✅ 已从深证接口拉取 {len(df_new)} 条数据"
-                    except Exception as e:
-                        df_new, parse_msg = None, f"❌ 深证接口拉取失败: {e}"
+
+                if parse_msg:
                     st.info(parse_msg)
 
                 if df_new is not None and not df_new.empty:
