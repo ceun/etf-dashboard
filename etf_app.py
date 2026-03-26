@@ -1508,7 +1508,11 @@ def parse_upload_file(uploaded_file):
     try:
         # parse_dates=False 阻止 pandas 自动转换日期，避免后续误判
         if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file, parse_dates=False)
+            try:
+                df = pd.read_csv(uploaded_file, parse_dates=False, encoding='utf-8')
+            except UnicodeDecodeError:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, parse_dates=False, encoding='gbk')
         else:
             df = pd.read_excel(uploaded_file, parse_dates=False)
         
