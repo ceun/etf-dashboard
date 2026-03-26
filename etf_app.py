@@ -1575,13 +1575,27 @@ def parse_upload_file(uploaded_file):
         df = df.dropna(subset=['Date', 'Close'])
         df = df.sort_values('Date').reset_index(drop=True)
 
-        # 合理性检查：日期应在 1990 年之后
-        bad = (df['Date'].dt.year < 1990).sum()
-        if bad > 0:
-            return None, (
-                f"❌ 检测到 {bad} 条日期早于 1990 年（可能解析错误），"
-                f"请检查文件格式。首行日期原始值: {raw_date.iloc[0]!r}"
-            )
+        # 容错处理：自动过滤常见的解析伪影（纯时间或空值常被底层库解析为默认纪元）
+        artifact_dates = pd.to_datetime(['1970-01-01', '1900-01-01', '1899-12-30', '1899-12-31'])
+        artifact_mask = df['Date'].isin(artifact_dates)
+        if artifact_mask.any():
+            df = df[~artifact_mask]
+
+        # 合理性检查：为了兼容标普500等海外长线指数，将年份下限放宽到 1920 年。
+        bad_mask = df['Date'].dt.year < 1920
+        bad_count = bad_mask.sum()
+        if bad_count > 0:
+            # 只有当超过一半的数据都是极早日期时，才认为是完全解析失败
+            if bad_count > len(df) * 0.5:
+                return None, (
+                    f"❌ 检测到大量异常极早日期（可能解析错误），请检查文件格式。首行日期: {raw_date.iloc[0]!r}"
+                )
+            else:
+                # 只有少量极早脏数据，直接过滤掉，不阻断流程
+                df = df[~bad_mask]
+
+        if df.empty:
+            return None, "❌ 文件中未提取到有效的数据行，请检查数据内容。"
 
         return df, f"✅ 成功解析 {len(df)} 条数据（{df['Date'].min().date()} ~ {df['Date'].max().date()}）"
     except Exception as e:
