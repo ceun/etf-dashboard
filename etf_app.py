@@ -454,7 +454,7 @@ def _normalize_data_source(data_source):
     if data_source is None:
         return ""
     code = str(data_source).strip().upper()
-    if code in {"SZ", "ZZ", "YH"}:
+    if code in {"SZ", "ZZ", "YH", "YHE"}:
         return code
     return ""
 
@@ -1571,6 +1571,11 @@ def parse_upload_file(uploaded_file):
                 parsed_date.loc[num_mask] = fixed
 
         df['Date']  = pd.to_datetime(parsed_date, errors='coerce')
+        
+        # 核心修复：移除收盘价中的千分位逗号和多余字符，避免 to_numeric 转换成 NaN
+        if df['Close'].dtype == object:
+            df['Close'] = df['Close'].astype(str).str.replace(',', '', regex=False).str.strip()
+            
         df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
         df = df.dropna(subset=['Date', 'Close'])
         df = df.sort_values('Date').reset_index(drop=True)
