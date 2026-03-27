@@ -1115,6 +1115,8 @@ def sync_target_data(index_code: str):
             if not etf_code:
                 raise RuntimeError(f"深证接口直连 {index_code} 失败，且当前未绑定 ETF：{e}")
             st.warning(f"深证接口直连 {index_code} 失败 ({e})，将自动走 ETF 拟合兜底方案。")
+            # 路由切换：强制降级走 ZZ（TickFlow ETF）拼接链路进行兜底更新
+            data_source = "ZZ"
     
     elif data_source == "YH":
         written_rows = _sync_data_from_yahoo(index_code)
@@ -1805,7 +1807,7 @@ with st.sidebar:
         tradition_start = st.date_input(
             "传统回归起始日期",
             value=DEFAULT_TRADITION_START,
-            min_value=DEFAULT_TRADITION_START,
+            min_value=pd.to_datetime("1990-01-01").date(),
             max_value=today,
             format="YYYY/MM/DD",
             key="tradition_start_date",
