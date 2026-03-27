@@ -1179,11 +1179,16 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     if len(sample_df) < 100:
         raise ValueError(f"传统回归样本不足（{len(sample_df)} 条），请检查数据起止日期")
     k_trad, b_trad = np.polyfit(sample_df['Years_Passed'], sample_df['Log_Close'], 1)
-    p_val_trad = np.nan
+    cagr_95ci = np.nan
     try:
         from scipy.stats import linregress
         res_lin = linregress(sample_df['Years_Passed'], sample_df['Log_Close'])
-        p_val_trad = res_lin.pvalue
+        # 95% 置信区间边界 ≈ 1.96 * 标准误
+        k_lower = k_trad - 1.96 * res_lin.stderr
+        k_upper = k_trad + 1.96 * res_lin.stderr
+        cagr_lower = (np.exp(k_lower) - 1) * 100
+        cagr_upper = (np.exp(k_upper) - 1) * 100
+        cagr_95ci = f"{cagr_lower:.2f}% ~ {cagr_upper:.2f}%"
     except ImportError:
         pass
     df['Trad_Pred_Log']   = k_trad * df['Years_Passed'] + b_trad
@@ -1319,7 +1324,7 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
         "z_plus": z_plus,
         "z_minus": z_minus,
         "std_trad": std_trad,
-        "p_value_trad": p_val_trad,
+        "cagr_95ci": cagr_95ci,
         "plot_df": df[[
             'Date', 'Close', 'Trad_Pred_Price', 'Roll_Pred_Price', 'MA_Price',
             'Trad_Z_Score', 'Roll_Z_Score', 'MA_Z_Score', 'Trad_Pred_Log',
@@ -1498,13 +1503,13 @@ def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, 
             rows.append({"name": name, "etf_code": display_etf_code,
                          "latest_date": f"加载失败: {e}",
                          "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
-                         "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "p_value": None, trad_range_col: None})
+                         "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "cagr_95ci": None, trad_range_col: None})
             continue
         if df is None or len(df) < rolling_window + 10:
             rows.append({"name": name, "etf_code": display_etf_code,
                          "latest_date": "无数据（请先拼接入库）",
                          "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
-                         "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "p_value": None, trad_range_col: None})
+                         "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "cagr_95ci": None, trad_range_col: None})
             continue
         try:
             fig, res = compute_and_plot(df, name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor)
@@ -1518,14 +1523,14 @@ def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, 
                 "trad_cagr_pct": round(res['cagr_trad'], 2),
                 "roll_cagr_pct": round(res['cagr_roll'], 2),
                 "sigma_pct": res['std_trad'] * 100,
-                "p_value": res.get('p_value_trad', np.nan),
+                "cagr_95ci": res.get('cagr_95ci', np.nan),
                 trad_range_col: f"{res['trad_range_start']} ~ {res['trad_range_end']}",
             })
         except Exception as e:
             rows.append({"name": name, "etf_code": display_etf_code,
                          "latest_date": f"出错: {e}",
                          "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
-                         "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "p_value": None, trad_range_col: None})
+                         "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "cagr_95ci": None, trad_range_col: None})
     return pd.DataFrame(rows)
 
 
@@ -1968,7 +1973,7 @@ with tab2:
             "trad_cagr_pct": "传统CAGR(%)",
             "roll_cagr_pct": "滚动CAGR(%)",
             "sigma_pct": "标准差(%)",
-            "p_value": "p值",
+            "cagr_95ci": "95%CI年化",
         }
         with st.spinner("计算全市场偏离度..."):
             compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG, tradition_start, tradition_end, rolling_window, ma_window)
@@ -1989,7 +1994,7 @@ with tab2:
                 "传统CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
                 "滚动CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
                 "标准差(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
-                "p值": lambda x: f"{x:.2e}" if pd.notna(x) else "缺库",
+                "95%CI年化": lambda x: str(x) if pd.notna(x) else "缺库",
             })
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
