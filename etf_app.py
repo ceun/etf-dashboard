@@ -1984,7 +1984,11 @@ with tab2:
             numeric_cols = ["trad_deviation_pct", "roll_deviation_pct", ma_dev_col]
             display_df = compare_df[list(display_columns.keys())].rename(columns=display_columns)
             gradient_subset = [display_columns[c] for c in numeric_cols if c in compare_df.columns]
-            styled = display_df.style.background_gradient(
+            center_cols = [c for c in display_df.columns if c != "标的"]
+            styled = display_df.style.set_properties(
+                subset=center_cols,
+                **{'text-align': 'center'}
+            ).background_gradient(
                 subset=gradient_subset,
                 cmap="coolwarm", vmin=-100, vmax=100,
             ).format({
