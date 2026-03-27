@@ -1807,7 +1807,7 @@ with st.sidebar:
         tradition_start = st.date_input(
             "传统回归起始日期",
             value=DEFAULT_TRADITION_START,
-            min_value=pd.to_datetime("1990-01-01").date(),
+            min_value=pd.to_datetime("1970-01-01").date(),
             max_value=today,
             format="YYYY/MM/DD",
             key="tradition_start_date",
@@ -1815,7 +1815,7 @@ with st.sidebar:
         tradition_end = st.date_input(
             "传统回归结束日期",
             value=today,
-            min_value=DEFAULT_TRADITION_START,
+            min_value=pd.to_datetime("1970-01-01").date(),
             max_value=today,
             format="YYYY/MM/DD",
             key="tradition_end_date",
