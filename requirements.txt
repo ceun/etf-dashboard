@@ -8,3 +8,4 @@ xlrd
 plotly
 tickflow
 yfinance
+scipy

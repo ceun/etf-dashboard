@@ -667,7 +667,7 @@ def _resolve_etf_stitch_series(df, raw_col="ETF_Close_Raw", hfq_col="ETF_Close_H
 
 
 def _estimate_scaling_factor_from_overlap(index_df, etf_code, default_sf=1.0):
-    """用最近重叠窗口的中位数比值估算缩放比例，提升 ETF 价格换算稳定性。"""
+    """提取重叠期最后一天的精确比值估算缩放比例，保证拼接的平滑无缝。"""
     try:
         etf_code = _normalize_etf_code(etf_code)
         if not etf_code:
@@ -699,7 +699,7 @@ def _estimate_scaling_factor_from_overlap(index_df, etf_code, default_sf=1.0):
 
 
 def _estimate_scaling_from_merged(merged_df, index_col, etf_col, default_sf=1.0, window=250):
-    """从重叠样本估算缩放比例：使用最近窗口 ratio 的中位数（多点拟合）。"""
+    """从重叠样本估算缩放比例：使用最后一天重叠的精确比值，彻底消除拼接缺口。"""
     if merged_df is None or merged_df.empty:
         return float(default_sf), None, 0
     work = merged_df.copy()
@@ -903,7 +903,7 @@ def _full_stitch_from_db(index_code):
             return False
         etf_df = _resolve_etf_stitch_series(etf_df)
         
-        # 用重叠窗口多点拟合缩放比例（避免单点锚定偏差）
+        # 取重叠期最后一天精准对齐（根除非同步偏差）
         merged = pd.merge(df_hist, etf_df, on='Date', how='inner')
         if merged.empty:
             return False
@@ -1179,6 +1179,13 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     if len(sample_df) < 100:
         raise ValueError(f"传统回归样本不足（{len(sample_df)} 条），请检查数据起止日期")
     k_trad, b_trad = np.polyfit(sample_df['Years_Passed'], sample_df['Log_Close'], 1)
+    p_val_trad = np.nan
+    try:
+        from scipy.stats import linregress
+        res_lin = linregress(sample_df['Years_Passed'], sample_df['Log_Close'])
+        p_val_trad = res_lin.pvalue
+    except ImportError:
+        pass
     df['Trad_Pred_Log']   = k_trad * df['Years_Passed'] + b_trad
     df['Trad_Pred_Price'] = np.exp(df['Trad_Pred_Log'])
     resids_trad = sample_df['Log_Close'] - (k_trad * sample_df['Years_Passed'] + b_trad)
@@ -1312,6 +1319,7 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
         "z_plus": z_plus,
         "z_minus": z_minus,
         "std_trad": std_trad,
+        "p_value_trad": p_val_trad,
         "plot_df": df[[
             'Date', 'Close', 'Trad_Pred_Price', 'Roll_Pred_Price', 'MA_Price',
             'Trad_Z_Score', 'Roll_Z_Score', 'MA_Z_Score', 'Trad_Pred_Log',
@@ -1490,13 +1498,13 @@ def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, 
             rows.append({"name": name, "etf_code": display_etf_code,
                          "latest_date": f"加载失败: {e}",
                          "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
-                         "trad_cagr_pct": None, "roll_cagr_pct": None, trad_range_col: None})
+                         "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "p_value": None, trad_range_col: None})
             continue
         if df is None or len(df) < rolling_window + 10:
             rows.append({"name": name, "etf_code": display_etf_code,
                          "latest_date": "无数据（请先拼接入库）",
                          "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
-                         "trad_cagr_pct": None, "roll_cagr_pct": None, trad_range_col: None})
+                         "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "p_value": None, trad_range_col: None})
             continue
         try:
             fig, res = compute_and_plot(df, name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor)
@@ -1509,13 +1517,15 @@ def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, 
                 ma_dev_col: round(res['dev_ma'], 2) if pd.notna(res['dev_ma']) else None,
                 "trad_cagr_pct": round(res['cagr_trad'], 2),
                 "roll_cagr_pct": round(res['cagr_roll'], 2),
+                "sigma_pct": res['std_trad'] * 100,
+                "p_value": res.get('p_value_trad', np.nan),
                 trad_range_col: f"{res['trad_range_start']} ~ {res['trad_range_end']}",
             })
         except Exception as e:
             rows.append({"name": name, "etf_code": display_etf_code,
                          "latest_date": f"出错: {e}",
                          "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
-                         "trad_cagr_pct": None, "roll_cagr_pct": None, trad_range_col: None})
+                         "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "p_value": None, trad_range_col: None})
     return pd.DataFrame(rows)
 
 
@@ -1650,7 +1660,7 @@ def stitch_with_tickflow(history_df, etf_code, asset_currency="CNY", report_curr
         merged['etf_close_hfq'] = pd.to_numeric(merged['ETF_Close_HFQ'], errors='coerce')
         merged['etf_price_for_stitch'] = pd.to_numeric(merged['ETF_Price_For_Stitch'], errors='coerce')
 
-        # 使用重叠窗口多点拟合缩放比例，找不到重叠样本才回落到 1.0
+        # 使用重叠期最后一天精确对齐缩放比例，找不到重叠样本才回落到 1.0
         overlap = merged[merged['index_close'].notna() & merged['etf_price_for_stitch'].notna()]
         if not overlap.empty:
             scaling_factor, stitch_date, used_n = _estimate_scaling_from_merged(
@@ -1665,7 +1675,7 @@ def stitch_with_tickflow(history_df, etf_code, asset_currency="CNY", report_curr
                 stitch_date = history_df['Date'].max().date()
                 msg_prefix = "⚠️ 重叠样本无有效价格，缩放比例暂设为 1.0"
             else:
-                msg_prefix = f"✅ 拼接成功，缩放比例: {scaling_factor:.4f}（多点拟合样本: {used_n}）"
+                msg_prefix = f"✅ 拼接成功，缩放比例: {scaling_factor:.4f}（最后一天精确对齐，探查窗口: {used_n}）"
         else:
             scaling_factor = 1.0
             stitch_date    = history_df['Date'].max().date()
@@ -1951,14 +1961,14 @@ with tab2:
         ma_dev_col = f"ma_{ma_window}_deviation_pct"
         display_columns = {
             "name": "标的",
-            "etf_code": "ETF代码",
-            "latest_date": "最新日期",
+            "trad_cagr_range": "范围",
             "trad_deviation_pct": "传统偏离度(%)",
             "roll_deviation_pct": "滚动偏离度(%)",
             ma_dev_col: f"MA{ma_window}偏离度(%)",
             "trad_cagr_pct": "传统CAGR(%)",
             "roll_cagr_pct": "滚动CAGR(%)",
-            "trad_cagr_range": "传统年化范围",
+            "sigma_pct": "标准差(%)",
+            "p_value": "p值",
         }
         with st.spinner("计算全市场偏离度..."):
             compare_df = build_comparison(deviation_pct, ACTIVE_ETF_CONFIG, tradition_start, tradition_end, rolling_window, ma_window)
@@ -1967,7 +1977,7 @@ with tab2:
             st.info("无数据，请先拼接入库。")
         else:
             numeric_cols = ["trad_deviation_pct", "roll_deviation_pct", ma_dev_col]
-            display_df = compare_df.rename(columns=display_columns)
+            display_df = compare_df[list(display_columns.keys())].rename(columns=display_columns)
             gradient_subset = [display_columns[c] for c in numeric_cols if c in compare_df.columns]
             styled = display_df.style.background_gradient(
                 subset=gradient_subset,
@@ -1978,6 +1988,8 @@ with tab2:
                 f"MA{ma_window}偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
                 "传统CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
                 "滚动CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
+                "标准差(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
+                "p值": lambda x: f"{x:.2e}" if pd.notna(x) else "缺库",
             })
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
