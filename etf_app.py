@@ -1274,10 +1274,15 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
         dev_ma = np.nan
 
     # 展示口径：优先使用原生不复权 ETF 收盘；缺失时才使用缩放换算
+    curr_fx = 1.0
+    if 'FX_To_CNY' in df.columns and pd.notna(df['FX_To_CNY'].iloc[-1]):
+        curr_fx = float(df['FX_To_CNY'].iloc[-1])
+
     def to_etf(point_value):
+        base_native = point_value / curr_fx
         if scaling_factor > 0:
-            return point_value / scaling_factor
-        return point_value
+            return base_native / scaling_factor
+        return base_native
 
     latest_raw = np.nan
     if 'ETF_Close_Raw' in df.columns:
