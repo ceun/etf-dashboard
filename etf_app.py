@@ -389,6 +389,9 @@ def fetch_all_from_yahoo(symbol, start_date="1991-01-01", end_date=None):
     if hist is None or hist.empty:
         return pd.DataFrame(columns=["Date", "Close", "Adj Close"])
 
+    if isinstance(hist.columns, pd.MultiIndex):
+        hist.columns = [col[0] for col in hist.columns]
+
     hist = hist.reset_index()
     if "Date" not in hist.columns or "Close" not in hist.columns or "Adj Close" not in hist.columns:
         raise ValueError(f"Yahoo Finance 返回字段不含 Date/Close/Adj Close: {list(hist.columns)}")
@@ -409,6 +412,13 @@ def calculate_hfq_series(df_yahoo_raw):
     if df_yahoo_raw is None or df_yahoo_raw.empty or "Adj Close" not in df_yahoo_raw.columns:
         return pd.DataFrame(columns=['Date', 'etf_close_hfq'])
     
+    # 边缘情况处理：如果只有一行数据，直接返回该行的 Close 作为 HFQ 基准
+    if len(df_yahoo_raw) == 1:
+        return pd.DataFrame({
+            'Date': pd.to_datetime([df_yahoo_raw['Date'].iloc[0]]),
+            'etf_close_hfq': [df_yahoo_raw['Close'].iloc[0]],
+        })
+
     work = df_yahoo_raw.copy()
     work['returns'] = work['Adj Close'].pct_change()
     
