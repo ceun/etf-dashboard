@@ -1876,8 +1876,7 @@ with st.sidebar:
                 conn.close()
                 if not summary.empty:
                     st.caption("📊 数据库概览")
-                    align_cfg_db = {c: st.column_config.Column(alignment="center") for c in summary.columns if c != summary.columns[0]}
-                    st.dataframe(summary, hide_index=True, use_container_width=True, column_config=align_cfg_db)
+                    st.dataframe(summary, hide_index=True, use_container_width=True)
         except Exception as e:
             st.caption(f"⚠️ 无法查询数据库: {e}")
     else:
@@ -2002,8 +2001,7 @@ with tab2:
             all_cols = list(display_columns.values())
             default_cols = [c for c in all_cols if "滚动" not in c]
             
-            align_cfg = {c: st.column_config.Column(alignment="center") for c in display_df.columns if c != "标的"}
-            st.dataframe(styled, use_container_width=True, hide_index=True, column_order=default_cols, column_config=align_cfg)
+            st.dataframe(styled, use_container_width=True, hide_index=True, column_order=default_cols)
 
             plot_df = compare_df.dropna(subset=["trad_deviation_pct", "roll_deviation_pct", ma_dev_col])
             if not plot_df.empty:
