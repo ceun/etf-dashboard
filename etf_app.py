@@ -1876,7 +1876,8 @@ with st.sidebar:
                 conn.close()
                 if not summary.empty:
                     st.caption("📊 数据库概览")
-                    st.dataframe(summary, hide_index=True, use_container_width=True)
+                    align_cfg_db = {c: st.column_config.Column(alignment="center") for c in summary.columns if c != summary.columns[0]}
+                    st.dataframe(summary, hide_index=True, use_container_width=True, column_config=align_cfg_db)
         except Exception as e:
             st.caption(f"⚠️ 无法查询数据库: {e}")
     else:
@@ -1984,11 +1985,7 @@ with tab2:
             numeric_cols = ["trad_deviation_pct", "roll_deviation_pct", ma_dev_col]
             display_df = compare_df[list(display_columns.keys())].rename(columns=display_columns)
             gradient_subset = [display_columns[c] for c in numeric_cols if c in compare_df.columns]
-            center_cols = [c for c in display_df.columns if c != "标的"]
-            styled = display_df.style.set_properties(
-                subset=center_cols,
-                **{'text-align': 'center'}
-            ).background_gradient(
+            styled = display_df.style.background_gradient(
                 subset=gradient_subset,
                 cmap="coolwarm", vmin=-100, vmax=100,
             ).format({
@@ -2005,7 +2002,8 @@ with tab2:
             all_cols = list(display_columns.values())
             default_cols = [c for c in all_cols if "滚动" not in c]
             
-            st.dataframe(styled, use_container_width=True, hide_index=True, column_order=default_cols)
+            align_cfg = {c: st.column_config.Column(alignment="center") for c in display_df.columns if c != "标的"}
+            st.dataframe(styled, use_container_width=True, hide_index=True, column_order=default_cols, column_config=align_cfg)
 
             plot_df = compare_df.dropna(subset=["trad_deviation_pct", "roll_deviation_pct", ma_dev_col])
             if not plot_df.empty:
