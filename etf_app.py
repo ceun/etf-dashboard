@@ -2368,7 +2368,11 @@ with tab4:
                 fig_dump, res_dump = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor)
                 plt.close(fig_dump)
                 b_df = res_dump['plot_df'].copy()
-            
+                
+                # 确保回测时间段与回归窗口严格一致
+                b_df['Date_Date'] = pd.to_datetime(b_df['Date']).dt.date
+                b_df = b_df[(b_df['Date_Date'] >= tradition_start) & (b_df['Date_Date'] <= tradition_end)].drop(columns=['Date_Date'])
+
             c_sig1, c_sig2 = st.columns(2)
             with c_sig1:
                 sig_choice = st.selectbox("核心策略信号层 (Signal Engine)", 
