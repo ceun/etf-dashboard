@@ -1876,7 +1876,7 @@ with st.sidebar:
                 conn.close()
                 if not summary.empty:
                     st.caption("📊 数据库概览")
-                    st.dataframe(summary, height=(len(summary) + 1) * 35 + 3, hide_index=True, use_container_width=True)
+                    st.dataframe(summary, height=(len(summary) + 1) * 35 + 40, hide_index=True, use_container_width=True)
         except Exception as e:
             st.caption(f"⚠️ 无法查询数据库: {e}")
     else:
@@ -2001,7 +2001,7 @@ with tab2:
             all_cols = list(display_columns.values())
             default_cols = [c for c in all_cols if "滚动" not in c]
             
-            st.dataframe(styled, height=(len(display_df) + 1) * 35 + 3, use_container_width=True, hide_index=True, column_order=default_cols)
+            st.dataframe(styled, height=(len(display_df) + 1) * 35 + 40, use_container_width=True, hide_index=True, column_order=default_cols)
 
             plot_df = compare_df.dropna(subset=["trad_deviation_pct", "roll_deviation_pct", ma_dev_col])
             if not plot_df.empty:
