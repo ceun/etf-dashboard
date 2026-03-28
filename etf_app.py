@@ -1793,10 +1793,12 @@ def stitch_with_yahoo(history_df, etf_code, asset_currency="CNY", report_currenc
         return None, 1.0, None, f"❌ YHE 拼接失败: {e}"
 
 # ─── 回测引擎 (Backtest Engine) ────────────────────────────────────────────────
-def backtest_strategy(df, signal_col, buy_thresh, sell_thresh):
+def backtest_strategy(df, signal_col, buy_thresh, sell_thresh, n_tranches=1, z_step=0.5):
     """
-    量化回测引擎：
-    基于指定信号列 (如 Z-Score) 的开平仓规则，在不考虑交易摩擦的情况下计算策略核心指标。
+    量化回测引擎 (Model A: 梯度金字塔左侧建仓版)：
+    基于指定信号列的开平仓规则，支持多级建仓与分批平仓。
+    buy_thresh: 首仓买入线 (例如 -0.5)。如果跌破 buy_thresh - z_step，触发第二挡加仓
+    sell_thresh: 首批平仓线 (例如 0.0)。如果突破 sell_thresh + z_step，触发第二挡减仓
     """
     t_df = df[['Date', 'Close', signal_col]].copy().dropna()
     t_df.reset_index(drop=True, inplace=True)
@@ -1804,29 +1806,62 @@ def backtest_strategy(df, signal_col, buy_thresh, sell_thresh):
     
     t_df['Ret'] = t_df['Close'].pct_change().fillna(0)
     
-    in_pos = False
+    N = int(n_tranches)
+    buy_triggers = [buy_thresh - k * z_step for k in range(N)]
+    sell_triggers = [sell_thresh + k * z_step for k in range(N)]
+    
     positions = np.zeros(len(t_df))
     trades = 0
     trade_returns = []
-    entry_price = np.nan
+    
+    pos_pct = 0.0
+    avg_cost = 0.0
     
     signal_arr = t_df[signal_col].to_numpy()
     close_arr = t_df['Close'].to_numpy()
     
     for i in range(len(signal_arr)):
         sig = signal_arr[i]
-        if not in_pos and sig <= buy_thresh:
-            in_pos = True
-            entry_price = close_arr[i]
-            positions[i] = 1
+        curr_price = close_arr[i]
+        
+        # 1. 计算当前极深情况下应有的底线建仓比例
+        triggered_buy_pos = 0.0
+        for k in range(N):
+            if sig <= buy_triggers[k]:
+                triggered_buy_pos = (k + 1) / N
+                
+        # 2. 如果应该加仓，更新成本与仓位 (左侧防抖机制：中途反弹绝不减仓！)
+        if triggered_buy_pos > pos_pct:
+            added_pct = triggered_buy_pos - pos_pct
+            if pos_pct == 0:
+                avg_cost = curr_price
+            else:
+                avg_cost = (avg_cost * pos_pct + curr_price * added_pct) / triggered_buy_pos
+            pos_pct = triggered_buy_pos
             trades += 1
-        elif in_pos and sig >= sell_thresh:
-            in_pos = False
-            exit_price = close_arr[i]
-            trade_returns.append((exit_price - entry_price) / entry_price)
-            positions[i] = 0
-        else:
-            positions[i] = 1 if in_pos else 0
+            
+        # 3. 计算在右侧上涨时，强制降低到的最高允许保留仓位
+        if pos_pct > 0:
+            triggered_sell_drop = 0.0
+            for k in range(N):
+                if sig >= sell_triggers[k]:
+                    triggered_sell_drop = (k + 1) / N
+                    
+            max_held = 1.0 - triggered_sell_drop
+            if max_held < 0: max_held = 0.0
+            
+            # 如果当前仓位高于允许保留的最大仓位，必须减仓止盈
+            if pos_pct > max_held:
+                sold_pct = pos_pct - max_held
+                realized_pnl = (curr_price - avg_cost) / avg_cost
+                trade_returns.append(realized_pnl)
+                pos_pct = max_held
+                trades += 1
+                if pos_pct <= 0.01: # 彻底清仓修正
+                    pos_pct = 0.0
+                    avg_cost = 0.0
+                    
+        positions[i] = pos_pct
             
     # 仓位顺延：当天收盘产生信号并持有，实际吃到的是第二天的涨跌幅
     pos_shifted = np.roll(positions, 1)
@@ -1860,13 +1895,13 @@ def backtest_strategy(df, signal_col, buy_thresh, sell_thresh):
         "Positions": positions
     }
 
-def run_grid_search(df, signal_col, buy_grid, sell_grid):
+def run_grid_search(df, signal_col, buy_grid, sell_grid, n_tranches=1, z_step=0.5):
     results = []
     for b in buy_grid:
         for s in sell_grid:
             if b >= s:
                 continue
-            metrics = backtest_strategy(df, signal_col, b, s)
+            metrics = backtest_strategy(df, signal_col, b, s, n_tranches, z_step)
             if np.isfinite(metrics["Calmar"]):
                 results.append({
                     "Buy": b,
@@ -2373,9 +2408,10 @@ with tab4:
                 b_df['Date_Date'] = pd.to_datetime(b_df['Date']).dt.date
                 b_df = b_df[(b_df['Date_Date'] >= tradition_start) & (b_df['Date_Date'] <= tradition_end)].drop(columns=['Date_Date'])
 
-            c_sig1, c_sig2 = st.columns(2)
+            st.markdown("##### ⚙️ 模型高级参数配置")
+            c_sig1, c_sig2, c_sig3, c_sig4 = st.columns(4)
             with c_sig1:
-                sig_choice = st.selectbox("核心策略信号层 (Signal Engine)", 
+                sig_choice = st.selectbox("核心策略信号层 (Signal)", 
                                           options=["Trad_Z_Score", "Roll_Z_Score", "MA_Z_Score"],
                                           format_func=lambda x: {
                                               "Trad_Z_Score": "传统恒定回归 Z-Score",
@@ -2383,14 +2419,20 @@ with tab4:
                                               "MA_Z_Score": f"MA{ma_window} 偏离度 Z-Score"
                                           }[x])
             with c_sig2:
-                grid_resolution = st.slider("网格暴搜精度 (Grid Resolution)", 1, 5, 2, 
-                                            help="精度越高搜索越密，计算随之变慢。1: 极速概览, 5: 极限密探")
+                n_tranches = st.number_input("左侧建仓阶数 (Tranches)", min_value=1, max_value=5, value=4, 
+                                            help="1为单点全仓；4代表资金分4批进场（25%, 50%, 75%, 100%）。")
+            with c_sig3:
+                z_step = st.number_input("各阶梯跨度 (Z-Step)", min_value=0.1, max_value=2.0, value=0.5, step=0.1, 
+                                        help="例如首仓线为 -1.0Z，跨度 0.5Z 时，第二仓在 -1.5Z，满仓在进一步跌破时打满。")
+            with c_sig4:
+                grid_resolution = st.slider("网格暴搜精度 (Resolution)", 1, 5, 2, 
+                                            help="决定参数组合密度。1: 极速概览, 5: 极限密探。")
                                             
             buy_grid = np.linspace(-3.0, -0.1, 10 * grid_resolution)
             sell_grid = np.linspace(-0.5, 2.5, 10 * grid_resolution)
             
-            with st.spinner("🚀 网格风暴暴搜计算中 (Grid Search In Progress)..."):
-                grid_res = run_grid_search(b_df, sig_choice, buy_grid, sell_grid)
+            with st.spinner(f"🚀 网格风暴暴搜计算中 (左侧阶乘={n_tranches})..."):
+                grid_res = run_grid_search(b_df, sig_choice, buy_grid, sell_grid, n_tranches, z_step)
                 
             if grid_res.empty:
                 st.warning("所选参数范围内未能碰触任何开仓线形成有效闭环交易，请尝试加大数据波动或放宽参数。")
@@ -2428,28 +2470,32 @@ with tab4:
                 st.divider()
                 st.subheader(f"📅 最佳参数实盘模拟资金曲线 ({etf_name})")
                 
-                best_metrics = backtest_strategy(b_df, sig_choice, best_params['Buy'], best_params['Sell'])
+                best_metrics = backtest_strategy(b_df, sig_choice, best_params['Buy'], best_params['Sell'], n_tranches, z_step)
                 bt_df = best_metrics['t_df']
                 
-                fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                       vertical_spacing=0.08, row_heights=[0.35, 0.65],
-                                       subplot_titles=("资金净值累计 (Equity Curve)", "标的原始走势与历史精准买卖点"))
+                fig_bt = make_subplots(rows=3, cols=1, shared_xaxes=True, 
+                                       vertical_spacing=0.06, row_heights=[0.3, 0.5, 0.2],
+                                       subplot_titles=("资金净值累计 (Equity Curve)", "标的原始走势与分批买卖点 (Scale In/Out)", "左侧防抖实票持仓率 (Position Target %)"))
                 
                 fig_bt.add_trace(go.Scatter(x=bt_df['Date'], y=bt_df['Cum_Ret'] + 1, mode='lines', 
-                                            name='资金净值随时间变化', line=dict(color='purple', width=2)), row=1, col=1)
+                                            name='资金净值', line=dict(color='purple', width=2)), row=1, col=1)
                 
                 fig_bt.add_trace(go.Scatter(x=bt_df['Date'], y=bt_df['Close'], mode='lines', 
-                                            name='底层标的走势', line=dict(color='#888', width=1)), row=2, col=1)
+                                            name='底层标的', line=dict(color='#888', width=1)), row=2, col=1)
                 
-                bt_df['Buy_Signal'] = np.where((bt_df['Pos'] == 1) & (bt_df['Pos'].shift(1).fillna(0) == 0), bt_df['Close'], np.nan)
-                bt_df['Sell_Signal'] = np.where((bt_df['Pos'] == 0) & (bt_df['Pos'].shift(1).fillna(0) == 1), bt_df['Close'], np.nan)
+                bt_df['Buy_Signal'] = np.where((bt_df['Pos'] > bt_df['Pos'].shift(1).fillna(0)), bt_df['Close'], np.nan)
+                bt_df['Sell_Signal'] = np.where((bt_df['Pos'] < bt_df['Pos'].shift(1).fillna(0)), bt_df['Close'], np.nan)
                 
                 fig_bt.add_trace(go.Scatter(x=bt_df['Date'], y=bt_df['Buy_Signal'], mode='markers',
-                                            name='全仓全垒买入', marker=dict(color='red', symbol='triangle-up', size=10)), row=2, col=1)
+                                            name='左侧买入/加仓', marker=dict(color='red', symbol='triangle-up', size=7)), row=2, col=1)
                 fig_bt.add_trace(go.Scatter(x=bt_df['Date'], y=bt_df['Sell_Signal'], mode='markers',
-                                            name='空仓离场卖出', marker=dict(color='green', symbol='triangle-down', size=10)), row=2, col=1)
+                                            name='右侧卖出/止盈', marker=dict(color='green', symbol='triangle-down', size=7)), row=2, col=1)
+                                            
+                fig_bt.add_trace(go.Scatter(x=bt_df['Date'], y=bt_df['Pos']*100, mode='lines',
+                                            name='实际持仓率(%)', fill='tozeroy', line=dict(color='#1f77b4', width=1)), row=3, col=1)
                 
-                fig_bt.update_layout(height=650, margin=dict(l=20, r=20, t=40, b=20), hovermode='x unified')
-                fig_bt.update_yaxes(title_text="净值 (1=本金)", row=1, col=1)
+                fig_bt.update_layout(height=800, margin=dict(l=20, r=20, t=40, b=20), hovermode='x unified')
+                fig_bt.update_yaxes(title_text="净值", row=1, col=1)
                 fig_bt.update_yaxes(title_text="指数点位", row=2, col=1)
+                fig_bt.update_yaxes(title_text="持仓(%)", range=[0, 105], row=3, col=1)
                 st.plotly_chart(fig_bt, use_container_width=True)
