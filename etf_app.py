@@ -1792,6 +1792,92 @@ def stitch_with_yahoo(history_df, etf_code, asset_currency="CNY", report_currenc
     except Exception as e:
         return None, 1.0, None, f"❌ YHE 拼接失败: {e}"
 
+# ─── 回测引擎 (Backtest Engine) ────────────────────────────────────────────────
+def backtest_strategy(df, signal_col, buy_thresh, sell_thresh):
+    """
+    量化回测引擎：
+    基于指定信号列 (如 Z-Score) 的开平仓规则，在不考虑交易摩擦的情况下计算策略核心指标。
+    """
+    t_df = df[['Date', 'Close', signal_col]].copy().dropna()
+    t_df.reset_index(drop=True, inplace=True)
+    t_df['Date'] = pd.to_datetime(t_df['Date'])
+    
+    t_df['Ret'] = t_df['Close'].pct_change().fillna(0)
+    
+    in_pos = False
+    positions = np.zeros(len(t_df))
+    trades = 0
+    trade_returns = []
+    entry_price = np.nan
+    
+    signal_arr = t_df[signal_col].to_numpy()
+    close_arr = t_df['Close'].to_numpy()
+    
+    for i in range(len(signal_arr)):
+        sig = signal_arr[i]
+        if not in_pos and sig <= buy_thresh:
+            in_pos = True
+            entry_price = close_arr[i]
+            positions[i] = 1
+            trades += 1
+        elif in_pos and sig >= sell_thresh:
+            in_pos = False
+            exit_price = close_arr[i]
+            trade_returns.append((exit_price - entry_price) / entry_price)
+            positions[i] = 0
+        else:
+            positions[i] = 1 if in_pos else 0
+            
+    # 仓位顺延：当天收盘产生信号并持有，实际吃到的是第二天的涨跌幅
+    pos_shifted = np.roll(positions, 1)
+    pos_shifted[0] = 0.0
+    
+    t_df['Pos'] = pos_shifted
+    t_df['Strat_Ret'] = t_df['Pos'] * t_df['Ret']
+    t_df['Cum_Ret'] = (1 + t_df['Strat_Ret']).cumprod()
+    
+    cum_max = t_df['Cum_Ret'].cummax()
+    t_df['Drawdown'] = t_df['Cum_Ret'] / cum_max - 1.0
+    
+    mdd = t_df['Drawdown'].min()
+    cum_ret = t_df['Cum_Ret'].iloc[-1] - 1.0
+    
+    days = (t_df['Date'].iloc[-1] - t_df['Date'].iloc[0]).days
+    years = days / 365.25 if days > 0 else 1.0
+    cagr = ((1 + cum_ret) ** (1 / years) - 1.0) if cum_ret > 0 else (cum_ret / years)
+    
+    calmar = cagr / abs(mdd) if mdd < 0 else (cagr * 10 if cagr > 0 else 0.0)
+    win_rate = sum(1 for r in trade_returns if r > 0) / len(trade_returns) if trade_returns else 0.0
+    
+    return {
+        "CAGR": cagr * 100,
+        "MDD": mdd * 100,
+        "Calmar": calmar,
+        "Trades": trades,
+        "Win_Rate": win_rate * 100,
+        "Cum_Ret": cum_ret * 100,
+        "t_df": t_df,
+        "Positions": positions
+    }
+
+def run_grid_search(df, signal_col, buy_grid, sell_grid):
+    results = []
+    for b in buy_grid:
+        for s in sell_grid:
+            if b >= s:
+                continue
+            metrics = backtest_strategy(df, signal_col, b, s)
+            if np.isfinite(metrics["Calmar"]):
+                results.append({
+                    "Buy": b,
+                    "Sell": s,
+                    "CAGR": metrics["CAGR"],
+                    "MDD": metrics["MDD"],
+                    "Calmar": metrics["Calmar"],
+                    "Trades": metrics["Trades"],
+                    "Win_Rate": metrics["Win_Rate"]
+                })
+    return pd.DataFrame(results)
 
 # ─── Streamlit UI ─────────────────────────────────────────────────────────────
 st.title("📈 今天买什么")
@@ -1882,7 +1968,7 @@ with st.sidebar:
     else:
         st.warning("⚠️ 未配置 database_url，请先设置 Streamlit secrets")
 
-tab1, tab2, tab3 = st.tabs(["📊 单标的详情", "📋 全市场对比", "⚙️ 数据管理"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 单标的详情", "📋 全市场对比", "⚙️ 数据管理", "🔬 策略回测"])
 
 with tab1:
     if not selected:
@@ -2258,3 +2344,108 @@ with tab3:
                 st.rerun()
             else:
                 st.warning("请选择标的并输入ETF代码。")
+
+with tab4:
+    st.subheader("🔬 均值回归策略回测引擎")
+    if not selected:
+        st.info("请先在左侧边栏「参数设置」中选择标的。")
+    else:
+        cfg = ACTIVE_ETF_CONFIG[selected]
+        index_code = cfg['index_code']
+        etf_name = cfg['name']
+        
+        with st.spinner(f"正在加载 {etf_name} 的历史数据以供回测..."):
+            try:
+                df, scaling_factor = get_data(index_code)
+            except Exception as e:
+                df = None
+                st.error(f"❌ 数据加载失败：{e}")
+        
+        if df is None or len(df) < rolling_window + 10:
+            st.warning("数据量不足以运行可靠的网格回测，请先在「数据管理」补充该标的指数历史数据。")
+        else:
+            with st.spinner("正在静默重构底层回归信号矩阵..."):
+                fig_dump, res_dump = compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window, ma_window, scaling_factor)
+                plt.close(fig_dump)
+                b_df = res_dump['plot_df'].copy()
+            
+            c_sig1, c_sig2 = st.columns(2)
+            with c_sig1:
+                sig_choice = st.selectbox("核心策略信号层 (Signal Engine)", 
+                                          options=["Trad_Z_Score", "Roll_Z_Score", "MA_Z_Score"],
+                                          format_func=lambda x: {
+                                              "Trad_Z_Score": "传统恒定回归 Z-Score",
+                                              "Roll_Z_Score": "滚动回归 Z-Score",
+                                              "MA_Z_Score": f"MA{ma_window} 偏离度 Z-Score"
+                                          }[x])
+            with c_sig2:
+                grid_resolution = st.slider("网格暴搜精度 (Grid Resolution)", 1, 5, 2, 
+                                            help="精度越高搜索越密，计算随之变慢。1: 极速概览, 5: 极限密探")
+                                            
+            buy_grid = np.linspace(-3.0, -0.1, 10 * grid_resolution)
+            sell_grid = np.linspace(-0.5, 2.5, 10 * grid_resolution)
+            
+            with st.spinner("🚀 网格风暴暴搜计算中 (Grid Search In Progress)..."):
+                grid_res = run_grid_search(b_df, sig_choice, buy_grid, sell_grid)
+                
+            if grid_res.empty:
+                st.warning("所选参数范围内未能碰触任何开仓线形成有效闭环交易，请尝试加大数据波动或放宽参数。")
+            else:
+                hm_df = grid_res.pivot(index="Buy", columns="Sell", values="Calmar")
+                
+                hm_fig = go.Figure(data=go.Heatmap(
+                    z=hm_df.values,
+                    x=hm_df.columns,
+                    y=hm_df.index,
+                    colorscale='Magma',
+                    hoverongaps=False,
+                    hovertemplate="卖出阈值(Sell): %{x:.2f}<br>买入阈值(Buy): %{y:.2f}<br><b>Calmar比率: %{z:.3f}</b><extra></extra>"
+                ))
+                hm_fig.update_layout(
+                    title=f"Calmar Ratio 参数孤岛热力图 ({sig_choice})",
+                    xaxis_title="平仓阈值 (Sell Threshold)",
+                    yaxis_title="开仓阈值 (Buy Threshold)",
+                    height=450,
+                    margin=dict(l=20, r=20, t=50, b=20)
+                )
+                st.plotly_chart(hm_fig, use_container_width=True)
+                
+                best_idx = grid_res['Calmar'].idxmax()
+                best_params = grid_res.loc[best_idx]
+                
+                st.markdown("### 💡 全局最优参数解 (Global Optimum Matrix)")
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("最佳买入线", f"{best_params['Buy']:.2f} Z")
+                m2.metric("最佳卖出线", f"{best_params['Sell']:.2f} Z")
+                m3.metric("优解 CAGR", f"{best_params['CAGR']:.2f}%")
+                m4.metric("最大回撤", f"{best_params['MDD']:.2f}%", delta_color="inverse")
+                m5.metric("触发交易数", f"{int(best_params['Trades'])} 笔")
+                
+                st.divider()
+                st.subheader(f"📅 最佳参数实盘模拟资金曲线 ({etf_name})")
+                
+                best_metrics = backtest_strategy(b_df, sig_choice, best_params['Buy'], best_params['Sell'])
+                bt_df = best_metrics['t_df']
+                
+                fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                       vertical_spacing=0.08, row_heights=[0.35, 0.65],
+                                       subplot_titles=("资金净值累计 (Equity Curve)", "标的原始走势与历史精准买卖点"))
+                
+                fig_bt.add_trace(go.Scatter(x=bt_df['Date'], y=bt_df['Cum_Ret'] + 1, mode='lines', 
+                                            name='资金净值随时间变化', line=dict(color='purple', width=2)), row=1, col=1)
+                
+                fig_bt.add_trace(go.Scatter(x=bt_df['Date'], y=bt_df['Close'], mode='lines', 
+                                            name='底层标的走势', line=dict(color='#888', width=1)), row=2, col=1)
+                
+                bt_df['Buy_Signal'] = np.where((bt_df['Pos'] == 1) & (bt_df['Pos'].shift(1).fillna(0) == 0), bt_df['Close'], np.nan)
+                bt_df['Sell_Signal'] = np.where((bt_df['Pos'] == 0) & (bt_df['Pos'].shift(1).fillna(0) == 1), bt_df['Close'], np.nan)
+                
+                fig_bt.add_trace(go.Scatter(x=bt_df['Date'], y=bt_df['Buy_Signal'], mode='markers',
+                                            name='全仓全垒买入', marker=dict(color='red', symbol='triangle-up', size=10)), row=2, col=1)
+                fig_bt.add_trace(go.Scatter(x=bt_df['Date'], y=bt_df['Sell_Signal'], mode='markers',
+                                            name='空仓离场卖出', marker=dict(color='green', symbol='triangle-down', size=10)), row=2, col=1)
+                
+                fig_bt.update_layout(height=650, margin=dict(l=20, r=20, t=40, b=20), hovermode='x unified')
+                fig_bt.update_yaxes(title_text="净值 (1=本金)", row=1, col=1)
+                fig_bt.update_yaxes(title_text="指数点位", row=2, col=1)
+                st.plotly_chart(fig_bt, use_container_width=True)
