@@ -2001,12 +2001,11 @@ with tab2:
                 "95%CI年化": lambda x: str(x) if pd.notna(x) else "缺库",
             })
             
-            # 允许用户控制显示的列，默认隐藏包含“滚动”字样的列
+            # 使用原生表格的 column_order 设置默认显示的列（包含“滚动”字样的默认隐藏到表格右上角的管理菜单中）
             all_cols = list(display_columns.values())
             default_cols = [c for c in all_cols if "滚动" not in c]
-            selected_cols = st.multiselect("自定显示指标", all_cols, default=default_cols, label_visibility="collapsed")
             
-            st.dataframe(styled, use_container_width=True, hide_index=True, column_order=selected_cols)
+            st.dataframe(styled, use_container_width=True, hide_index=True, column_order=default_cols)
 
             plot_df = compare_df.dropna(subset=["trad_deviation_pct", "roll_deviation_pct", ma_dev_col])
             if not plot_df.empty:
