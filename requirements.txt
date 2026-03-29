@@ -9,3 +9,4 @@ plotly
 tickflow
 yfinance
 scipy
+akshare
