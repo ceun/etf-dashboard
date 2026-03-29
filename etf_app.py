@@ -1857,13 +1857,14 @@ def load_macro_from_db(indicator_name):
         return pd.DataFrame()
 
 def fetch_and_store_hs300_pe():
-    """通过 akshare 拉取沪深300历史 PE 并存入数据库"""
+    """通过 akshare 拉取沪深300历史 PE 并存入数据库（多接口回退策略）"""
     import akshare as ak
     _ensure_macro_table()
-    try:
-        raw = ak.index_value_hist_funddb(symbol="沪深300", indicator="市盈率")
+    
+    def _try_parse_pe(raw, source_name):
+        """通用 PE 数据解析：从 DataFrame 中提取 (date, value) 并写库"""
         if raw is None or raw.empty:
-            return 0, "akshare 返回空数据"
+            return 0, f"{source_name}: 返回空数据"
         raw.columns = [c.strip() for c in raw.columns]
         col_map = {}
         for c in raw.columns:
@@ -1874,16 +1875,51 @@ def fetch_and_store_hs300_pe():
                 col_map['value'] = c
         if 'date' not in col_map or 'value' not in col_map:
             col_map['date'] = raw.columns[0]
-            col_map['value'] = raw.columns[1]
+            # 找第一个数值列
+            for c in raw.columns[1:]:
+                if pd.to_numeric(raw[c], errors='coerce').notna().sum() > len(raw) * 0.5:
+                    col_map['value'] = c
+                    break
+            if 'value' not in col_map:
+                col_map['value'] = raw.columns[1]
         df = raw[[col_map['date'], col_map['value']]].copy()
         df.columns = ['date', 'value']
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
         df['value'] = pd.to_numeric(df['value'], errors='coerce')
         df = df.dropna()
+        if df.empty:
+            return 0, f"{source_name}: 解析后无有效数据"
         n = _save_macro_to_db(df, 'hs300_pe')
-        return n, f"✅ 成功写入 {n} 条沪深300 PE 数据"
-    except Exception as e:
-        return 0, f"❌ 拉取沪深300 PE 失败: {e}"
+        return n, f"✅ [{source_name}] 成功写入 {n} 条沪深300 PE 数据"
+    
+    # 方案 1: stock_index_pe_lg（乐咕乐股，长周期历史 PE）
+    try:
+        raw = ak.stock_index_pe_lg(symbol="沪深300")
+        n, msg = _try_parse_pe(raw, "stock_index_pe_lg")
+        if n > 0:
+            return n, msg
+    except Exception:
+        pass
+    
+    # 方案 2: stock_zh_index_value_csindex（中证官方，近期数据）
+    try:
+        raw = ak.stock_zh_index_value_csindex(symbol="000300")
+        n, msg = _try_parse_pe(raw, "stock_zh_index_value_csindex")
+        if n > 0:
+            return n, msg
+    except Exception:
+        pass
+    
+    # 方案 3: index_value_hist_funddb（旧版 FundDB，可能已移除）
+    try:
+        raw = ak.index_value_hist_funddb(symbol="沪深300", indicator="市盈率")
+        n, msg = _try_parse_pe(raw, "index_value_hist_funddb")
+        if n > 0:
+            return n, msg
+    except Exception:
+        pass
+    
+    return 0, "❌ 所有 akshare PE 数据接口均失败，请检查 akshare 版本或网络环境"
 
 def fetch_and_store_cn10y_yield():
     """通过 akshare 拉取中国10年期国债收益率并存入数据库"""
