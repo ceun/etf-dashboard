@@ -735,6 +735,46 @@ def _exclude_today_rows(df, date_col="Date"):
     return work[work[date_col].dt.date < today].copy()
 
 
+SAFE_LOOKBACK_DAYS = 14
+
+
+def _get_last_effective_date(index_code):
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        res = pd.read_sql(
+            """
+            SELECT MAX(date) AS last_effective_date
+            FROM etf_prices
+            WHERE index_code=%s
+              AND (
+                combined_close IS NOT NULL
+                OR index_close IS NOT NULL
+                OR etf_close_raw IS NOT NULL
+                OR etf_close_hfq IS NOT NULL
+              )
+            """,
+            conn,
+            params=(_normalize_index_code(index_code),),
+        )
+        if res.empty or pd.isna(res.iloc[0]["last_effective_date"]):
+            return None
+        return pd.to_datetime(res.iloc[0]["last_effective_date"]).date()
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def _get_incremental_start_date(index_code, lookback_days=SAFE_LOOKBACK_DAYS, default_start="1991-01-01"):
+    last_effective_date = _get_last_effective_date(index_code)
+    if last_effective_date is None:
+        return str(default_start)
+    start_date = pd.Timestamp(last_effective_date) - pd.Timedelta(days=int(lookback_days))
+    return start_date.strftime("%Y-%m-%d")
+
+
 def _keep_last_n_trading_days(df, n=3, date_col="Date"):
     work = df.copy()
     work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
@@ -971,13 +1011,15 @@ def _incremental_tickflow_update(index_code, etf_code, scaling_factor):
     meta = _get_target_meta(index_code)
     asset_currency = _normalize_currency(meta.get("asset_currency")) or "CNY"
     report_currency = _normalize_currency(meta.get("report_currency")) or "CNY"
-    recent_all = fetch_recent_from_tickflow(etf_code, count=30)
+    start_date = pd.to_datetime(_get_incremental_start_date(index_code))
+    recent_all = fetch_all_from_tickflow(etf_code)
     recent_all = _exclude_today_rows(recent_all, date_col='Date')
     if recent_all.empty:
         return 0
     recent_all = _resolve_etf_stitch_series(recent_all)
+    recent_all['Date'] = pd.to_datetime(recent_all['Date'], errors='coerce')
 
-    patch_data = _keep_last_n_trading_days(recent_all, n=3, date_col='Date')
+    patch_data = recent_all[recent_all['Date'] >= start_date].copy()
     if patch_data.empty:
         return 0
 
@@ -997,12 +1039,7 @@ def _incremental_tickflow_update(index_code, etf_code, scaling_factor):
 
 def _incremental_yahoo_update(index_code, etf_code, scaling_factor):
     """增量刷新YHE数据：重新计算完整后复权序列，保证数据准确性。"""
-    # 1. Get the last date from our DB
-    conn = get_db_connection()
-    if not conn: return 0
-    last_date_res = pd.read_sql("SELECT MAX(date) as last_date FROM etf_prices WHERE index_code=%s", conn, params=(_normalize_index_code(index_code),))
-    conn.close()
-    last_date = pd.to_datetime(last_date_res['last_date'].iloc[0]) if not last_date_res.empty and pd.notna(last_date_res['last_date'].iloc[0]) else None
+    start_date = pd.to_datetime(_get_incremental_start_date(index_code))
 
     # 2. Fetch full history and calculate full, correct HFQ series
     etf_raw_df = fetch_all_from_yahoo(etf_code)
@@ -1019,10 +1056,8 @@ def _incremental_yahoo_update(index_code, etf_code, scaling_factor):
         how='left'
     )
     
-    if last_date:
-        patch_data = etf_df[etf_df['Date'] > last_date].copy()
-    else: # Should not happen in incremental mode, but as a fallback
-        patch_data = etf_df.copy()
+    etf_df['Date'] = pd.to_datetime(etf_df['Date'], errors='coerce')
+    patch_data = etf_df[etf_df['Date'] >= start_date].copy()
 
     if patch_data.empty: return 0
 
@@ -1062,11 +1097,7 @@ def sync_target_data(index_code: str):
     if data_source == "SZ":
         try:
             _delete_today_prices_from_db(index_code)
-            df_existing, _ = load_from_db(index_code)
-            start_date = "1991-01-01"
-            if df_existing is not None and not df_existing.empty:
-                last_date = df_existing['Date'].max().date()
-                start_date = (last_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+            start_date = _get_incremental_start_date(index_code)
 
             hist = fetch_szse_index_daily(index_code=index_code, start_date=start_date, end_date="2050-01-01")
             hist = _exclude_today_rows(hist, date_col="Date")
