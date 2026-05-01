@@ -1256,6 +1256,11 @@ def get_data(index_code: str):
 # ─── 核心分析 ─────────────────────────────────────────────────────────────────
 def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end, rolling_window=1250, ma_window=250, scaling_factor=1.0):
     df = df.copy()
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+    df = df.dropna(subset=['Date', 'Close']).sort_values('Date').reset_index(drop=True)
+    if len(df) < max(100, rolling_window + 10):
+        raise ValueError(f"Valid close sample too small ({len(df)} rows); check missing latest prices.")
     df['Log_Close'] = np.log(df['Close'])
     # 计算物理时间差（自然年），代替固定的行号索引
     df['Years_Passed'] = (df['Date'] - df['Date'].iloc[0]).dt.days / 365.25
@@ -1367,10 +1372,11 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     fig.autofmt_xdate()
     plt.tight_layout()
 
-    latest_close = float(df['Close'].iloc[-1])
-    trad_pred    = float(df['Trad_Pred_Price'].iloc[-1])
-    roll_pred    = float(df['Roll_Pred_Price'].iloc[-1])
-    ma_pred   = float(df['MA_Price'].iloc[-1]) if pd.notna(df['MA_Price'].iloc[-1]) else np.nan
+    latest_idx = df['Close'].last_valid_index()
+    latest_close = float(df.loc[latest_idx, 'Close'])
+    trad_pred    = float(df.loc[latest_idx, 'Trad_Pred_Price'])
+    roll_pred    = float(df.loc[latest_idx, 'Roll_Pred_Price']) if pd.notna(df.loc[latest_idx, 'Roll_Pred_Price']) else np.nan
+    ma_pred   = float(df.loc[latest_idx, 'MA_Price']) if pd.notna(df.loc[latest_idx, 'MA_Price']) else np.nan
 
     if pd.notna(ma_pred) and ma_pred > 0:
         dev_ma = (latest_close / ma_pred - 1) * 100
@@ -1379,8 +1385,11 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
 
     # 展示口径：优先使用原生不复权 ETF 收盘；缺失时才使用缩放换算
     curr_fx = 1.0
-    if 'FX_To_CNY' in df.columns and pd.notna(df['FX_To_CNY'].iloc[-1]):
-        curr_fx = float(df['FX_To_CNY'].iloc[-1])
+    if 'FX_To_CNY' in df.columns:
+        fx_series = pd.to_numeric(df['FX_To_CNY'], errors='coerce')
+        fx_valid = fx_series.last_valid_index()
+        if fx_valid is not None and pd.notna(fx_series.loc[fx_valid]):
+            curr_fx = float(fx_series.loc[fx_valid])
 
     def to_etf(point_value):
         base_native = point_value / curr_fx
@@ -1390,11 +1399,14 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
 
     latest_raw = np.nan
     if 'ETF_Close_Raw' in df.columns:
-        latest_raw = pd.to_numeric(df['ETF_Close_Raw'].iloc[-1], errors='coerce')
+        raw_series = pd.to_numeric(df['ETF_Close_Raw'], errors='coerce')
+        raw_valid = raw_series.last_valid_index()
+        if raw_valid is not None:
+            latest_raw = raw_series.loc[raw_valid]
     latest_etf_price = float(latest_raw) if pd.notna(latest_raw) else to_etf(latest_close)
     
     return fig, {
-        "latest_date":  df['Date'].iloc[-1].strftime('%Y-%m-%d'),
+        "latest_date":  df.loc[latest_idx, 'Date'].strftime('%Y-%m-%d'),
         "trad_range_start": sample_df['Date'].iloc[0].strftime('%Y-%m-%d'),
         "trad_range_end": sample_df['Date'].iloc[-1].strftime('%Y-%m-%d'),
         "latest_close": latest_close,
