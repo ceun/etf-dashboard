@@ -1083,6 +1083,65 @@ def _incremental_yahoo_update(index_code, etf_code, scaling_factor):
     return int(save_prices_to_db(patch_data_to_save, index_code))
 
 
+def _sync_data_from_yahoo(index_code):
+    meta = _get_target_meta(index_code)
+    etf_code = _normalize_etf_code(meta.get("etf_code"))
+    asset_currency = _normalize_currency(meta.get("asset_currency")) or "CNY"
+    report_currency = _normalize_currency(meta.get("report_currency")) or "CNY"
+
+    _delete_today_prices_from_db(index_code)
+    start_date = _get_incremental_start_date(index_code)
+
+    hist = fetch_yahoo_history(index_code, start_date=start_date)
+    hist = _exclude_today_rows(hist, date_col="Date")
+    if hist.empty:
+        return 0
+
+    sf = _estimate_scaling_factor_from_overlap(
+        hist,
+        etf_code,
+        default_sf=meta["scaling_factor"] if etf_code else 1.0,
+    )
+
+    if etf_code:
+        etf_all = fetch_all_from_tickflow(etf_code)
+        etf_all = _exclude_today_rows(etf_all, date_col="Date")
+        merged = pd.merge(hist, etf_all, on="Date", how="left")
+    else:
+        merged = hist.copy()
+        merged["ETF_Close_Raw"] = None
+        merged["ETF_Close_HFQ"] = None
+
+    converted = _apply_currency_conversion(
+        merged[["Date", "Index_Close"]],
+        asset_currency=asset_currency,
+        report_currency=report_currency,
+    )
+    rows = pd.DataFrame({
+        "Date": merged["Date"],
+        "index_close": merged["Index_Close"],
+        "etf_close_raw": merged["ETF_Close_Raw"],
+        "etf_close_hfq": merged["ETF_Close_HFQ"],
+        "asset_close_native": converted["asset_close_native"],
+        "fx_to_cny": converted["fx_to_cny"],
+        "close_cny": converted["close_cny"],
+        "combined_close": converted["combined_close"],
+    })
+    written_rows = save_prices_to_db(rows, index_code)
+
+    save_target_to_db(
+        index_code,
+        meta["name"],
+        etf_code=etf_code or None,
+        scaling_factor=sf,
+        stitch_date=hist["Date"].max().date(),
+        data_source="YH",
+        asset_currency=asset_currency,
+        report_currency=report_currency,
+    )
+    return int(written_rows)
+
+
 def sync_target_data(index_code: str):
     """
     统一的数据同步函数，根据标的类型分发任务。
