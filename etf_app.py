@@ -1678,7 +1678,7 @@ def parse_upload_file(uploaded_file):
             text_mask = numeric_raw.isna()
             if text_mask.any():
                 parsed_date.loc[text_mask] = pd.to_datetime(
-                    raw_date.loc[text_mask], infer_datetime_format=True, errors='coerce'
+                    raw_date.loc[text_mask], errors='coerce'
                 )
 
             # 数字日期：按量级判断类型，完全避免 1970 误判
