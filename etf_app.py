@@ -190,6 +190,10 @@ def save_prices_to_db(df, index_code):
         work['close_cny'] = pd.to_numeric(work['close_cny'], errors='coerce')
         work['combined_close'] = pd.to_numeric(work['combined_close'], errors='coerce')
 
+        # combined_close 在冲突时会无条件覆盖旧值（非 COALESCE），缺失行必须在此剔除，
+        # 否则源数据瞬时缺失会把库里已有的有效价格冲成 NaN。
+        work = work.dropna(subset=['combined_close'])
+
         rows = []
         for _, row in work[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']].iterrows():
             rows.append((
@@ -775,16 +779,6 @@ def _get_incremental_start_date(index_code, lookback_days=SAFE_LOOKBACK_DAYS, de
     return start_date.strftime("%Y-%m-%d")
 
 
-def _keep_last_n_trading_days(df, n=3, date_col="Date"):
-    work = df.copy()
-    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
-    trade_days = sorted(work[date_col].dt.date.dropna().unique())
-    if len(trade_days) <= n:
-        return work.sort_values(date_col).reset_index(drop=True)
-    keep_days = set(trade_days[-n:])
-    return work[work[date_col].dt.date.isin(keep_days)].sort_values(date_col).reset_index(drop=True)
-
-
 def _delete_today_prices_from_db(index_code):
     conn = get_db_connection()
     if not conn:
@@ -889,6 +883,7 @@ def _check_needs_full_stitch(index_code):
                     WHERE p.date > h.last_index_date
                       AND p.index_close IS NULL
                       AND p.combined_close IS NOT NULL
+                      AND p.combined_close <> 'NaN'::float8
                       AND (p.etf_close_raw IS NOT NULL OR p.etf_close_hfq IS NOT NULL)
                 ) AS stitched_after_tail
             FROM history_tail h
@@ -1007,7 +1002,7 @@ def _full_stitch_from_db(index_code):
 
 
 def _incremental_tickflow_update(index_code, etf_code, scaling_factor):
-    """增量刷新：每次覆盖最近三个交易日，且当日数据不落盘。"""
+    """增量刷新：每次回补最近 SAFE_LOOKBACK_DAYS 个自然日，且当日数据不落盘。"""
     meta = _get_target_meta(index_code)
     asset_currency = _normalize_currency(meta.get("asset_currency")) or "CNY"
     report_currency = _normalize_currency(meta.get("report_currency")) or "CNY"
