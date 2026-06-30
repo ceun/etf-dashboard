@@ -1025,10 +1025,13 @@ def _incremental_tickflow_update(index_code, etf_code, scaling_factor):
         'Index_Close': patch_data['ETF_Price_For_Stitch'] * scaling_factor,
     })
     conv = _apply_currency_conversion(native_df, asset_currency=asset_currency, report_currency=report_currency)
-    patch_data['asset_close_native'] = conv['asset_close_native']
-    patch_data['fx_to_cny'] = conv['fx_to_cny']
-    patch_data['close_cny'] = conv['close_cny']
-    patch_data['combined_close'] = conv['combined_close']
+    # 用 Date 合并而非按索引直接赋值：_apply_currency_conversion 内部对同币种会触发
+    # pd.merge 拼汇率序列，merge 会重置索引，导致按索引赋值整列错位变成 NaN。
+    patch_data = pd.merge(
+        patch_data,
+        conv[['Date', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']],
+        on='Date', how='left',
+    )
     return int(save_prices_to_db(patch_data[['Date', 'index_close', 'etf_close_raw', 'etf_close_hfq', 'asset_close_native', 'fx_to_cny', 'close_cny', 'combined_close']], index_code))
 
 
