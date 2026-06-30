@@ -1381,6 +1381,9 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     else:
         dev_ma = np.nan
 
+    z_trad_latest = df.loc[latest_idx, 'Trad_Z_Score']
+    z_trad_latest = float(z_trad_latest) if pd.notna(z_trad_latest) else np.nan
+
     # 展示口径：优先使用原生不复权 ETF 收盘；缺失时才使用缩放换算
     curr_fx = 1.0
     if 'FX_To_CNY' in df.columns:
@@ -1418,6 +1421,7 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
         "dev_trad":     (latest_close / trad_pred - 1) * 100,
         "dev_roll":     (latest_close / roll_pred - 1) * 100,
         "dev_ma":       dev_ma,
+        "z_trad_latest": z_trad_latest,
         "cagr_trad":    (np.exp(k_trad) - 1) * 100,
         "cagr_roll":    (np.exp(k_roll_last) - 1) * 100,
         "scaling_factor": scaling_factor,
@@ -1602,13 +1606,13 @@ def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, 
         except Exception as e:
             rows.append({"name": name, "etf_code": display_etf_code,
                          "latest_date": f"加载失败: {e}",
-                         "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
+                         "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None, "trad_z_score": None,
                          "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "cagr_95ci": None, trad_range_col: None})
             continue
         if df is None or len(df) < rolling_window + 10:
             rows.append({"name": name, "etf_code": display_etf_code,
                          "latest_date": "无数据（请先拼接入库）",
-                         "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
+                         "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None, "trad_z_score": None,
                          "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "cagr_95ci": None, trad_range_col: None})
             continue
         try:
@@ -1620,6 +1624,7 @@ def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, 
                 "trad_deviation_pct": round(res['dev_trad'], 2),
                 "roll_deviation_pct": round(res['dev_roll'], 2),
                 ma_dev_col: round(res['dev_ma'], 2) if pd.notna(res['dev_ma']) else None,
+                "trad_z_score": round(res['z_trad_latest'], 2) if pd.notna(res['z_trad_latest']) else None,
                 "trad_cagr_pct": round(res['cagr_trad'], 2),
                 "roll_cagr_pct": round(res['cagr_roll'], 2),
                 "sigma_pct": res['std_trad'] * 100,
@@ -1629,7 +1634,7 @@ def build_comparison(deviation_pct, etf_config, tradition_start, tradition_end, 
         except Exception as e:
             rows.append({"name": name, "etf_code": display_etf_code,
                          "latest_date": f"出错: {e}",
-                         "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None,
+                         "trad_deviation_pct": None, "roll_deviation_pct": None, ma_dev_col: None, "trad_z_score": None,
                          "trad_cagr_pct": None, "roll_cagr_pct": None, "sigma_pct": None, "cagr_95ci": None, trad_range_col: None})
     return pd.DataFrame(rows)
 
@@ -2287,6 +2292,7 @@ with tab2:
             "name": "标的",
             "trad_cagr_range": "范围",
             "trad_deviation_pct": "传统偏离度(%)",
+            "trad_z_score": "传统Z值(σ)",
             "roll_deviation_pct": "滚动偏离度(%)",
             ma_dev_col: f"MA{ma_window}偏离度(%)",
             "trad_cagr_pct": "传统CAGR(%)",
@@ -2308,6 +2314,7 @@ with tab2:
                 cmap="coolwarm", vmin=-100, vmax=100,
             ).format({
                 "传统偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
+                "传统Z值(σ)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
                 "滚动偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
                 f"MA{ma_window}偏离度(%)": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
                 "传统CAGR(%)": lambda x: f"{x:.2f}" if pd.notna(x) else "—",
