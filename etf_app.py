@@ -1381,6 +1381,9 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
     else:
         dev_ma = np.nan
 
+    z_trad_latest = df.loc[latest_idx, 'Trad_Z_Score']
+    z_trad_latest = float(z_trad_latest) if pd.notna(z_trad_latest) else np.nan
+
     # 展示口径：优先使用原生不复权 ETF 收盘；缺失时才使用缩放换算
     curr_fx = 1.0
     if 'FX_To_CNY' in df.columns:
@@ -1418,6 +1421,7 @@ def compute_and_plot(df, etf_name, deviation_pct, tradition_start, tradition_end
         "dev_trad":     (latest_close / trad_pred - 1) * 100,
         "dev_roll":     (latest_close / roll_pred - 1) * 100,
         "dev_ma":       dev_ma,
+        "z_trad_latest": z_trad_latest,
         "cagr_trad":    (np.exp(k_trad) - 1) * 100,
         "cagr_roll":    (np.exp(k_roll_last) - 1) * 100,
         "scaling_factor": scaling_factor,
@@ -2256,10 +2260,11 @@ with tab1:
                 c3.metric("ETF原生不复权", f"{res['latest_etf_price']:.4f}")
 
                 st.subheader("传统回归")
-                c4, c5, c6, c7 = st.columns(4)
+                c4, c5, c6, c6z, c7 = st.columns(5)
                 c4.metric("指数点位", f"{res['trad_pred']:,.0f}")
                 c5.metric("换算预估价格", f"{res['trad_pred_etf']:.4f}")
                 c6.metric("偏离度", f"{res['dev_trad']:+.2f}%", delta_color="inverse")
+                c6z.metric("Z值", f"{res['z_trad_latest']:+.2f}σ" if pd.notna(res['z_trad_latest']) else "—")
                 c7.metric("年化", f"{res['cagr_trad']:.2f}%")
 
                 st.subheader("滚动回归")
