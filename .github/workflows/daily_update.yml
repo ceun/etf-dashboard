@@ -1,0 +1,38 @@
+name: 每日数据更新
+
+on:
+  schedule:
+    # UTC 22:30 = 北京时间次日 06:30（A股/港股/亚洲市场前一交易日已收盘落定）
+    - cron: "30 22 * * *"
+  workflow_dispatch: {}   # 允许在 Actions 页面手动触发
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-data-update
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONIOENCODING: utf-8
+      DATABASE_URL_POOLER: ${{ secrets.DATABASE_URL_POOLER }}
+      TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run data sync
+        run: python sync_all.py
