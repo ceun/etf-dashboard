@@ -23,8 +23,8 @@
 """
 import os
 import sys
+import time
 import types
-import traceback
 
 
 # ── 1. Streamlit 垫片 ────────────────────────────────────────────────────────
@@ -95,6 +95,26 @@ exec(compile(_src[:_cut], APP_PATH, "exec"), core.__dict__)
 
 
 # ── 3. 逐个标的同步 ──────────────────────────────────────────────────────────
+MAX_ATTEMPTS = 3   # 上游数据源（TickFlow/Yahoo）偶发断连，单标的重试几次
+RETRY_SLEEP = 5    # 每次重试间隔（秒）
+
+
+def _sync_one(index_code):
+    """同步单个标的，失败自动重试。返回落库行数；重试用尽则抛最后一次异常。"""
+    last_err = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            _, _, written = core.sync_target_data(index_code)
+            return int(written or 0), attempt
+        except Exception as e:  # noqa: BLE001  含上游网络抖动，可重试
+            last_err = e
+            if attempt < MAX_ATTEMPTS:
+                print(f"  ↻ {index_code} 第 {attempt}/{MAX_ATTEMPTS} 次失败：{e}，{RETRY_SLEEP}s 后重试",
+                      flush=True)
+                time.sleep(RETRY_SLEEP)
+    raise last_err
+
+
 def main():
     if not getattr(core, "DATABASE_URL", None):
         print("ERROR: 未配置数据库连接串，请设置环境变量 DATABASE_URL_POOLER（或 DATABASE_URL）。",
@@ -112,13 +132,13 @@ def main():
     for name, cfg in targets.items():
         index_code = cfg.get("index_code")
         try:
-            _, _, written = core.sync_target_data(index_code)
-            total_written += int(written or 0)
-            print(f"OK   {name} ({index_code})：落库 {written} 条", flush=True)
+            written, attempt = _sync_one(index_code)
+            total_written += written
+            suffix = f"（第 {attempt} 次尝试）" if attempt > 1 else ""
+            print(f"OK   {name} ({index_code})：落库 {written} 条{suffix}", flush=True)
         except Exception as e:  # noqa: BLE001  单个标的失败不影响其余标的
             failures.append((name, index_code))
             print(f"FAIL {name} ({index_code})：{e}", flush=True)
-            traceback.print_exc()
 
     ok = len(targets) - len(failures)
     print(f"\n完成：{ok}/{len(targets)} 成功，累计落库 {total_written} 条。", flush=True)
