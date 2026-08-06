@@ -1680,9 +1680,16 @@ def parse_upload_file(uploaded_file):
             # 文本日期（如 "2020-01-01" / "2020/01/01" / "20200101"）
             text_mask = numeric_raw.isna()
             if text_mask.any():
-                parsed_date.loc[text_mask] = pd.to_datetime(
-                    raw_date.loc[text_mask], errors='coerce'
-                )
+                date_text = raw_date.loc[text_mask].astype(str).str.strip()
+                # 逐一使用常见格式解析，避免 pandas 按首行推断格式后把其余格式不同的日期变为 NaT。
+                for date_format in ("%Y/%m/%d", "%Y-%m-%d", "%Y%m%d", "%m/%d/%Y", "%d/%m/%Y"):
+                    unresolved = parsed_date.loc[text_mask].isna()
+                    if not unresolved.any():
+                        break
+                    unresolved_index = unresolved[unresolved].index
+                    parsed_date.loc[unresolved_index] = pd.to_datetime(
+                        date_text.loc[unresolved_index], format=date_format, errors='coerce'
+                    )
 
             # 数字日期：按量级判断类型，完全避免 1970 误判
             num_mask = numeric_raw.notna()
