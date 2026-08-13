@@ -1,0 +1,21 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: vue_app/backend/Dockerfile
+    environment:
+      DATABASE_URL_POOLER: ${DATABASE_URL_POOLER}
+      TICKFLOW_API_KEY: ${TICKFLOW_API_KEY:-}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
+      CORS_ORIGINS: http://localhost:8080
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: vue_app/frontend/Dockerfile
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped

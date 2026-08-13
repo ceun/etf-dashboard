@@ -1717,7 +1717,7 @@ def parse_upload_file(uploaded_file):
         df['Date']  = pd.to_datetime(parsed_date, errors='coerce')
         
         # 核心修复：移除收盘价中的千分位逗号和多余字符，避免 to_numeric 转换成 NaN
-        if df['Close'].dtype == object:
+        if not pd.api.types.is_numeric_dtype(df['Close']):
             df['Close'] = df['Close'].astype(str).str.replace(',', '', regex=False).str.strip()
             
         df['Close'] = pd.to_numeric(df['Close'], errors='coerce')

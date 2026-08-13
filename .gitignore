@@ -2,3 +2,11 @@ etf_data.db
 __pycache__/
 *.pyc
 .streamlit/secrets.toml
+vue_app/.env
+vue_app/backend/.env
+vue_app/.venv/
+vue_app/frontend/.env.local
+vue_app/frontend/node_modules/
+vue_app/frontend/dist/
+.pnpm-store/
+vue_app/frontend/*.tsbuildinfo
