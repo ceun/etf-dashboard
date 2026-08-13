@@ -48,8 +48,11 @@ async function syncAll() {
     <div class="sidebar-section">
       <label>分析标的</label>
       <select v-model="appState.selectedIndex" :disabled="appState.loadingTargets">
+        <option v-if="appState.loadingTargets && !appState.targets.length" value="">正在唤醒后端并加载…</option>
         <option v-for="target in appState.targets" :key="target.index_code" :value="target.index_code">{{ target.name }}</option>
       </select>
+      <button v-if="appState.targetError && !appState.loadingTargets" class="secondary-button full" @click="loadTargets">重新加载标的</button>
+      <p v-if="appState.targetError" class="small-note">{{ appState.loadingTargets ? '免费后端正在唤醒，请稍候…' : appState.targetError }}</p>
     </div>
 
     <div class="sidebar-section parameter-grid">
